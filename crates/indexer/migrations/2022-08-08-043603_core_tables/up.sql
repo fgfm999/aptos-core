@@ -166,9 +166,10 @@ CREATE TABLE user_transactions (
   -- Default time columns
   inserted_at TIMESTAMP NOT NULL DEFAULT NOW(),
   -- Constraints
-  CONSTRAINT fk_versions FOREIGN KEY (version) REFERENCES transactions (version),
+--   CONSTRAINT fk_versions FOREIGN KEY (version) REFERENCES transactions (version),
   UNIQUE (sender, sequence_number)
 );
+CREATE INDEX ut_entry ON user_transactions (entry_function_id_str);
 CREATE INDEX ut_sender_seq_index ON user_transactions (sender, sequence_number);
 CREATE INDEX ut_insat_index ON user_transactions (inserted_at);
 -- tracks signatures for user transactions
@@ -219,9 +220,10 @@ CREATE TABLE events (
     account_address,
     creation_number,
     sequence_number
-  ),
-  CONSTRAINT fk_transaction_versions FOREIGN KEY (transaction_version) REFERENCES transactions (version)
+  )
+--   CONSTRAINT fk_transaction_versions FOREIGN KEY (transaction_version) REFERENCES transactions (version)
 );
+CREATE INDEX ev_type ON events (type);
 CREATE INDEX ev_addr_type_index ON events (account_address);
 CREATE INDEX ev_insat_index ON events (inserted_at);
 -- write set changes
