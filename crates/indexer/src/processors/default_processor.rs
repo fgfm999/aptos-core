@@ -74,19 +74,19 @@ fn insert_to_db_impl(
     let (move_modules, move_resources, table_items, current_table_items, table_metadata) =
         wsc_details;
     let (objects, current_objects) = object_core;
-    insert_transactions(conn, txns)?;
+    // insert_transactions(conn, txns)?;
     insert_user_transactions(conn, user_transactions)?;
-    insert_signatures(conn, signatures)?;
-    insert_block_metadata_transactions(conn, block_metadata_transactions)?;
+    // insert_signatures(conn, signatures)?;
+    // insert_block_metadata_transactions(conn, block_metadata_transactions)?;
     insert_events(conn, events)?;
-    insert_write_set_changes(conn, wscs)?;
-    insert_move_modules(conn, move_modules)?;
-    insert_move_resources(conn, move_resources)?;
-    insert_table_items(conn, table_items)?;
+    // insert_write_set_changes(conn, wscs)?;
+    // insert_move_modules(conn, move_modules)?;
+    // insert_move_resources(conn, move_resources)?;
+    // insert_table_items(conn, table_items)?;
     insert_current_table_items(conn, current_table_items)?;
-    insert_table_metadata(conn, table_metadata)?;
-    insert_objects(conn, objects)?;
-    insert_current_objects(conn, current_objects)?;
+    // insert_table_metadata(conn, table_metadata)?;
+    // insert_objects(conn, objects)?;
+    // insert_current_objects(conn, current_objects)?;
     Ok(())
 }
 
