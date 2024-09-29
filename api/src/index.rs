@@ -30,11 +30,14 @@ impl IndexApi {
         tag = "ApiTags::General"
     )]
     async fn get_ledger_info(&self, accept_type: AcceptType) -> BasicResult<IndexResponse> {
+        eprintln!("[IndexApi::get_ledger_info]");
         self.context
             .check_api_output_enabled("Get ledger info", &accept_type)?;
+        eprintln!("[IndexApi::get_ledger_info] before self.context.get_latest_ledger_info");
         let ledger_info = self.context.get_latest_ledger_info()?;
         let node_role = self.context.node_role();
 
+        eprintln!("[IndexApi::get_ledger_info] before api_spawn_blocking");
         api_spawn_blocking(move || match accept_type {
             AcceptType::Json => {
                 let index_response = IndexResponse::new(
