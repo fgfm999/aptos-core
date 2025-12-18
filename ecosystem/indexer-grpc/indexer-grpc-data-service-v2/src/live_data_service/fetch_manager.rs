@@ -82,7 +82,8 @@ impl<'a> FetchManager<'a> {
                 info!("Finished fetching latest data, got {num_transactions} num_transactions starting from version {version}.");
                 return num_transactions;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            info!("No new data available yet when fetching latest data starting from version {version}, retrying...");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
