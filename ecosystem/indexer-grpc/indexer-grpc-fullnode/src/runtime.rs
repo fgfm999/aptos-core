@@ -88,9 +88,9 @@ pub fn bootstrap(
         let localnet_data_server = LocalnetDataService { service_context };
 
         let data_server_descriptor_set = if use_data_service_interface {
-            FULLNODE_V1_FILE_DESCRIPTOR_SET
-        } else {
             INDEXER_V1_FILE_DESCRIPTOR_SET
+        } else {
+            FULLNODE_V1_FILE_DESCRIPTOR_SET
         };
 
         let reflection_service = tonic_reflection::server::Builder::configure()
