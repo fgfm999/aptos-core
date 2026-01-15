@@ -177,7 +177,8 @@ impl<'a> LiveDataService<'a> {
             }
             self.connection_manager
                 .update_stream_progress(&id, next_version, size_bytes);
-            let known_latest_version = self.get_known_latest_version();
+            // let known_latest_version = self.get_known_latest_version();
+            let known_latest_version = self.in_memory_cache.data_manager.read().await.end_version;
             if next_version > known_latest_version {
                 info!(stream_id = id, "next_version {next_version} is larger than known_latest_version {known_latest_version}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
