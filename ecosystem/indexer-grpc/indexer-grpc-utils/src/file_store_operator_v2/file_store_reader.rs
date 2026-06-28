@@ -90,7 +90,9 @@ impl FileStoreReader {
         if batch_metadata.is_none() {
             // TODO(grao): This is unexpected, should only happen when data is corrupted. Consider
             // make it panic!.
-            error!("Failed to get the batch metadata, unable to serve the request.");
+            error!(
+                "Failed to get the batch metadata, unable to serve the request. version={version}, retries={retries}"
+            );
             return;
         }
 
