@@ -9,7 +9,7 @@ use crate::{
 use futures::future::{BoxFuture, FutureExt, Shared};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 type FetchTask<'a> = Shared<BoxFuture<'a, usize>>;
 
@@ -82,7 +82,8 @@ impl<'a> FetchManager<'a> {
                 info!("Finished fetching latest data, got {num_transactions} num_transactions starting from version {version}.");
                 return num_transactions;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            warn!("No new data available yet when fetching latest data starting from version {version}, retrying...");
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
 }
