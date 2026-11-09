@@ -11,7 +11,7 @@ use aptos_api_types::{AsConverter, Transaction as APITransaction, TransactionOnC
 use aptos_indexer_grpc_utils::{
     chunk_transactions,
     constants::MESSAGE_SIZE_LIMIT,
-    counters::{log_grpc_step_fullnode, IndexerGrpcStep},
+    counters::{log_grpc_step_fullnode, observe_indexer_stage, IndexerGrpcStep},
 };
 use aptos_logger::{error, info, sample, sample::SampleRate, warn};
 use aptos_protos::{
@@ -59,6 +59,7 @@ pub struct IndexerStreamCoordinator {
     pub transactions_sender: mpsc::Sender<Result<TransactionsFromNodeResponse, tonic::Status>>,
     pub filter: Option<BooleanTransactionFilter>,
     abort_handle: Option<Arc<AtomicBool>>,
+    wait_stage: &'static str,
 }
 
 // Single batch of transactions to fetch, convert, and stream
@@ -93,6 +94,7 @@ impl IndexerStreamCoordinator {
             transactions_sender,
             filter,
             abort_handle,
+            wait_stage: "fullnode_wait_ledger",
         }
     }
 
@@ -180,10 +182,34 @@ impl IndexerStreamCoordinator {
         for batch in task_batches {
             let context = self.context.clone();
             let filter = filter.clone();
+            let queued_at = std::time::Instant::now();
             let task = tokio::task::spawn_blocking(move || {
+                let start_version = batch.first().unwrap().version;
+                let end_version = batch.last().unwrap().version;
+                observe_indexer_stage(
+                    "conversion_queue",
+                    start_version,
+                    end_version,
+                    queued_at.elapsed(),
+                );
+                let api_start = std::time::Instant::now();
                 let raw_txns = batch;
                 let api_txns = Self::convert_to_api_txns(context, raw_txns);
+                observe_indexer_stage(
+                    "api_conversion",
+                    start_version,
+                    end_version,
+                    api_start.elapsed(),
+                );
+                let pb_start = std::time::Instant::now();
                 let pb_txns = Self::convert_to_pb_txns(api_txns);
+                observe_indexer_stage(
+                    "protobuf_construction",
+                    start_version,
+                    end_version,
+                    pb_start.elapsed(),
+                );
+                let response_start = std::time::Instant::now();
                 // Apply filter if present.
                 let pb_txns = if let Some(ref filter) = filter {
                     pb_txns
@@ -208,12 +234,23 @@ impl IndexerStreamCoordinator {
                         responses.push(item);
                     }
                 }
-                responses
+                observe_indexer_stage(
+                    "filter_and_chunk",
+                    start_version,
+                    end_version,
+                    response_start.elapsed(),
+                );
+                (
+                    responses,
+                    std::time::Instant::now(),
+                    start_version,
+                    end_version,
+                )
             });
             tasks.push(task);
         }
         let responses = match futures::future::try_join_all(tasks).await {
-            Ok(res) => res.into_iter().flatten().collect::<Vec<_>>(),
+            Ok(res) => res,
             Err(err) => panic!(
                 "[Indexer Fullnode] Error processing transaction batches: {:?}",
                 err
@@ -231,10 +268,26 @@ impl IndexerStreamCoordinator {
         );
         // Stage 3: send responses to stream
         let sending_start_time = std::time::Instant::now();
-        for response in responses {
-            if self.transactions_sender.send(Ok(response)).await.is_err() {
-                // Error from closed channel. This means the client has disconnected.
-                return vec![];
+        for (responses, completed_at, start_version, end_version) in responses {
+            observe_indexer_stage(
+                "conversion_ready_to_send",
+                start_version,
+                end_version,
+                completed_at.elapsed(),
+            );
+            for response in responses {
+                let send_start = std::time::Instant::now();
+                let result = self.transactions_sender.send(Ok(response)).await;
+                observe_indexer_stage(
+                    "internal_send",
+                    start_version,
+                    end_version,
+                    send_start.elapsed(),
+                );
+                if result.is_err() {
+                    // Error from closed channel. This means the client has disconnected.
+                    return vec![];
+                }
             }
         }
         log_grpc_step_fullnode(
@@ -261,7 +314,14 @@ impl IndexerStreamCoordinator {
         let ledger_version = self.highest_known_version;
         for batch in batches {
             let context = self.context.clone();
+            let queued_at = std::time::Instant::now();
             let task = tokio::spawn(async move {
+                observe_indexer_stage(
+                    "storage_queue",
+                    batch.start_version,
+                    batch.start_version + u64::from(batch.num_transactions_to_fetch) - 1,
+                    queued_at.elapsed(),
+                );
                 Self::fetch_raw_txns_with_retries(context.clone(), ledger_version, batch).await
             });
             storage_fetch_tasks.push(task);
@@ -286,14 +346,24 @@ impl IndexerStreamCoordinator {
             }
         }
 
-        Ok(transactions_from_storage
+        let prepare_start = std::time::Instant::now();
+        let transactions = transactions_from_storage
             .into_iter()
             .sorted_by(|a, b| a.version.cmp(&b.version))
             .map(|txn| {
                 let size = bcs::serialized_size(&txn).expect("Unable to serialize txn");
                 (txn, size)
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        if let (Some((first, _)), Some((last, _))) = (transactions.first(), transactions.last()) {
+            observe_indexer_stage(
+                "sort_and_size",
+                first.version,
+                last.version,
+                prepare_start.elapsed(),
+            );
+        }
+        Ok(transactions)
     }
 
     /// Gets the last version of the batch if the entire batch is successful, otherwise return error
@@ -349,11 +419,19 @@ impl IndexerStreamCoordinator {
     ) -> Result<Vec<TransactionOnChainData>, Status> {
         let mut retries = 0;
         loop {
-            match context.get_transactions(
+            let read_start = std::time::Instant::now();
+            let result = context.get_transactions(
                 batch.start_version,
                 batch.num_transactions_to_fetch,
                 ledger_version,
-            ) {
+            );
+            observe_indexer_stage(
+                "storage_read_attempt",
+                batch.start_version,
+                batch.start_version + u64::from(batch.num_transactions_to_fetch) - 1,
+                read_start.elapsed(),
+            );
+            match result {
                 Ok(raw_txns) => return Ok(raw_txns),
                 Err(err) => {
                     UNABLE_TO_FETCH_TRANSACTION.inc();
@@ -581,6 +659,12 @@ impl IndexerStreamCoordinator {
             .get_latest_table_info_ledger_version()?
             .expect("Table info ledger version not set");
 
+        self.wait_stage =
+            if self.current_version > info.ledger_version.0 || info.ledger_version.0 == 0 {
+                "fullnode_wait_ledger"
+            } else {
+                "fullnode_wait_table_info"
+            };
         self.highest_known_version =
             std::cmp::min(info.ledger_version.0, latest_table_info_version);
 
@@ -591,17 +675,29 @@ impl IndexerStreamCoordinator {
     /// If there are, it will set the highest known version
     async fn ensure_highest_known_version(&mut self) -> bool {
         let mut empty_loops = 0;
+        let mut waits = [Duration::ZERO; 3];
         while self.highest_known_version == 0 || self.current_version > self.highest_known_version {
             if let Some(abort_handle) = self.abort_handle.as_ref() {
                 if abort_handle.load(Ordering::SeqCst) {
                     return false;
                 }
             }
+            let poll_start = std::time::Instant::now();
+            let wait_index = match self.wait_stage {
+                "fullnode_wait_ledger" => 0,
+                "fullnode_wait_table_info" => 1,
+                _ => 2,
+            };
             if empty_loops > 0 {
                 tokio::time::sleep(Duration::from_millis(RETRY_TIME_MILLIS)).await;
             }
             empty_loops += 1;
-            if let Err(err) = self.set_highest_known_version() {
+            let result = self.set_highest_known_version();
+            if empty_loops > 1 {
+                waits[wait_index] += poll_start.elapsed();
+            }
+            if let Err(err) = result {
+                self.wait_stage = "fullnode_wait_error";
                 error!(
                     error = format!("{:?}", err),
                     "[Indexer Fullnode] Failed to set highest known version"
@@ -615,6 +711,18 @@ impl IndexerStreamCoordinator {
                         "[Indexer Fullnode] Found new highest known version",
                     )
                 );
+            }
+        }
+        for (stage, elapsed) in [
+            "fullnode_wait_ledger",
+            "fullnode_wait_table_info",
+            "fullnode_wait_error",
+        ]
+        .into_iter()
+        .zip(waits)
+        {
+            if !elapsed.is_zero() {
+                observe_indexer_stage(stage, self.current_version, self.current_version, elapsed);
             }
         }
         true

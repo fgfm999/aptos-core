@@ -201,6 +201,7 @@ impl TableInfoService {
         batches: Vec<TransactionBatchInfo>,
         ledger_version: u64,
     ) -> anyhow::Result<Vec<TransactionOnChainData>> {
+        let fetch_start = std::time::Instant::now();
         // Spawn a bunch of threads to fetch transactions in parallel.
         let mut tasks = vec![];
         for batch in batches.iter().cloned() {
@@ -234,6 +235,14 @@ impl TableInfoService {
                 "Transactions are not sorted {:?}",
                 versions
             )));
+        }
+        if let (Some(first), Some(last)) = (result.first(), result.last()) {
+            aptos_indexer_grpc_utils::counters::observe_indexer_stage(
+                "table_fetch_and_sort",
+                first.version,
+                last.version,
+                fetch_start.elapsed(),
+            );
         }
         Ok(result)
     }
@@ -297,7 +306,14 @@ impl TableInfoService {
 
                 // Drop any handles still unresolved after the retry and advance, so parsing
                 // keeps making progress instead of stalling on them.
+                let finalize_start = std::time::Instant::now();
                 self.indexer_async_v2.finalize_batch(end_version).unwrap();
+                aptos_indexer_grpc_utils::counters::observe_indexer_stage(
+                    "table_finalize",
+                    transactions.first().unwrap().version,
+                    end_version,
+                    finalize_start.elapsed(),
+                );
 
                 res
             },
@@ -398,9 +414,16 @@ impl TableInfoService {
         let start_time = std::time::Instant::now();
         let first_version = raw_txns.first().map(|txn| txn.version).unwrap();
         let write_sets = raw_txns.iter().map(|txn| &txn.changes).collect::<Vec<_>>();
-        indexer_async_v2
+        let result = indexer_async_v2
             .index_table_info(context.db.clone(), first_version, &write_sets)
-            .map_err(|err| anyhow!("[Table Info] Failed to process write sets and index to the table info rocksdb: {}", err))?;
+            .map_err(|err| anyhow!("[Table Info] Failed to process write sets and index to the table info rocksdb: {}", err));
+        aptos_indexer_grpc_utils::counters::observe_indexer_stage(
+            "table_parse_and_write",
+            first_version,
+            raw_txns.last().unwrap().version,
+            start_time.elapsed(),
+        );
+        result?;
 
         info!(
             table_info_first_version = first_version,
@@ -491,6 +514,7 @@ impl TableInfoService {
         let mut info = self.context.get_latest_ledger_info_wrapped();
         let mut ledger_version = info.unwrap().ledger_version.0;
         let mut empty_loops = 0;
+        let wait_start = std::time::Instant::now();
 
         while ledger_version == 0 || self.current_version.load(Ordering::SeqCst) > ledger_version {
             if self.aborted.load(Ordering::SeqCst) {
@@ -519,6 +543,15 @@ impl TableInfoService {
                     )
                 );
             }
+        }
+        if empty_loops > 0 {
+            let version = self.current_version.load(Ordering::SeqCst);
+            aptos_indexer_grpc_utils::counters::observe_indexer_stage(
+                "table_wait_ledger",
+                version,
+                version,
+                wait_start.elapsed(),
+            );
         }
         Ok(ledger_version)
     }

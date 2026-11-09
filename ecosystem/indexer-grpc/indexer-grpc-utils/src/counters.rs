@@ -198,11 +198,11 @@ pub static TRANSACTION_STORE_FETCH_RETRIES: Lazy<IntCounterVec> = Lazy::new(|| {
 
 /// Generic duration metric
 pub static DURATION_IN_SECS: Lazy<GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("indexer_grpc_duration_in_secs", "Duration in seconds", &[
-        "service_type",
-        "step",
-        "message"
-    ])
+    register_gauge_vec!(
+        "indexer_grpc_duration_in_secs",
+        "Duration in seconds",
+        &["service_type", "step", "message"]
+    )
     .unwrap()
 });
 
@@ -366,5 +366,33 @@ pub fn log_grpc_step_fullnode(
         step = step.get_step(),
         "{}",
         step.get_label(),
+    );
+}
+
+/// Stage wall time per invocation; version ranges belong in logs, never labels.
+pub fn observe_indexer_stage(
+    stage: &'static str,
+    start_version: u64,
+    end_version: u64,
+    elapsed: std::time::Duration,
+) {
+    static DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+        prometheus::register_histogram_vec!(
+            "indexer_grpc_stage_duration_seconds",
+            "Indexer stage wall time per invocation, including failed attempts where observed",
+            &["stage"],
+            prometheus::exponential_buckets(0.000001, 2.0, 23).unwrap()
+        )
+        .unwrap()
+    });
+    DURATION
+        .with_label_values(&[stage])
+        .observe(elapsed.as_secs_f64());
+    tracing::debug!(
+        stage = stage,
+        start_version = start_version,
+        end_version = end_version,
+        duration_secs = elapsed.as_secs_f64(),
+        "Indexer stage completed"
     );
 }

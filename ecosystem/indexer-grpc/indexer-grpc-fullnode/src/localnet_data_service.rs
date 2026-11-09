@@ -134,7 +134,23 @@ impl RawData for LocalnetDataService {
                     },
                     processed_range: None,
                 });
-                match external_service_tx.send(response).await {
+                let versions = response.as_ref().ok().and_then(|r| {
+                    Some((
+                        r.transactions.first()?.version,
+                        r.transactions.last()?.version,
+                    ))
+                });
+                let send_start = std::time::Instant::now();
+                let result = external_service_tx.send(response).await;
+                if let Some((first, last)) = versions {
+                    aptos_indexer_grpc_utils::counters::observe_indexer_stage(
+                        "external_send",
+                        first,
+                        last,
+                        send_start.elapsed(),
+                    );
+                }
+                match result {
                     Ok(_) => {},
                     Err(e) => {
                         aptos_logger::warn!(
