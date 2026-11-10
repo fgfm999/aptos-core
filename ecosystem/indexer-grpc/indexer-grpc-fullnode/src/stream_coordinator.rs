@@ -249,13 +249,13 @@ impl IndexerStreamCoordinator {
             });
             tasks.push(task);
         }
-        let responses = match futures::future::try_join_all(tasks).await {
-            Ok(res) => res,
-            Err(err) => panic!(
-                "[Indexer Fullnode] Error processing transaction batches: {:?}",
-                err
-            ),
-        };
+        let timings =
+            match send_ordered_batches(tasks, &self.transactions_sender, decoding_start_time).await
+            {
+                Ok(Some(timings)) => timings,
+                Ok(None) => return vec![],
+                Err(status) => return vec![Err(status)],
+            };
         log_grpc_step_fullnode(
             IndexerGrpcStep::FullnodeDecodedBatch,
             Some(first_version),
@@ -263,33 +263,9 @@ impl IndexerStreamCoordinator {
             last_transaction_timestamp.as_ref(),
             Some(highest_known_version),
             None,
-            Some(decoding_start_time.elapsed().as_secs_f64()),
+            Some(timings.0.as_secs_f64()),
             Some(num_transactions as i64),
         );
-        // Stage 3: send responses to stream
-        let sending_start_time = std::time::Instant::now();
-        for (responses, completed_at, start_version, end_version) in responses {
-            observe_indexer_stage(
-                "conversion_ready_to_send",
-                start_version,
-                end_version,
-                completed_at.elapsed(),
-            );
-            for response in responses {
-                let send_start = std::time::Instant::now();
-                let result = self.transactions_sender.send(Ok(response)).await;
-                observe_indexer_stage(
-                    "internal_send",
-                    start_version,
-                    end_version,
-                    send_start.elapsed(),
-                );
-                if result.is_err() {
-                    // Error from closed channel. This means the client has disconnected.
-                    return vec![];
-                }
-            }
-        }
         log_grpc_step_fullnode(
             IndexerGrpcStep::FullnodeSentBatch,
             Some(first_version),
@@ -297,7 +273,7 @@ impl IndexerStreamCoordinator {
             last_transaction_timestamp.as_ref(),
             Some(highest_known_version),
             None,
-            Some(sending_start_time.elapsed().as_secs_f64()),
+            Some(timings.1.as_secs_f64()),
             Some(num_transactions as i64),
         );
         vec![Ok(end_version as u64)]
@@ -726,5 +702,202 @@ impl IndexerStreamCoordinator {
             }
         }
         true
+    }
+}
+
+type ConvertedBatch = (
+    Vec<TransactionsFromNodeResponse>,
+    std::time::Instant,
+    u64,
+    u64,
+);
+
+struct ConversionTasks(Vec<tokio::task::JoinHandle<ConvertedBatch>>);
+
+impl Drop for ConversionTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            // Running blocking tasks finish normally; queued tasks can be cancelled.
+            task.abort();
+        }
+    }
+}
+
+async fn send_ordered_batches(
+    tasks: Vec<tokio::task::JoinHandle<ConvertedBatch>>,
+    sender: &mpsc::Sender<Result<TransactionsFromNodeResponse, Status>>,
+    conversion_started: std::time::Instant,
+) -> Result<Option<(Duration, Duration)>, Status> {
+    let mut tasks = ConversionTasks(tasks);
+    let mut conversion_duration = Duration::ZERO;
+    let mut sending_duration = Duration::ZERO;
+    for task in &mut tasks.0 {
+        let result = tokio::select! {
+            biased;
+            _ = sender.closed() => return Ok(None),
+            result = task => result,
+        };
+        let (responses, completed_at, first, last) = match result {
+            Ok(batch) => batch,
+            Err(err) => {
+                let status =
+                    Status::internal(format!("Transaction conversion task failed: {}", err));
+                let _ = sender.send(Err(status.clone())).await;
+                return Err(status);
+            },
+        };
+        conversion_duration =
+            conversion_duration.max(completed_at.duration_since(conversion_started));
+        observe_indexer_stage(
+            "conversion_ready_to_send",
+            first,
+            last,
+            completed_at.elapsed(),
+        );
+        for response in responses {
+            let started = std::time::Instant::now();
+            let result = sender.send(Ok(response)).await;
+            let elapsed = started.elapsed();
+            sending_duration += elapsed;
+            observe_indexer_stage("internal_send", first, last, elapsed);
+            if result.is_err() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some((conversion_duration, sending_duration)))
+}
+
+#[cfg(test)]
+mod ordered_delivery_tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    fn batch(version: u64) -> ConvertedBatch {
+        (
+            vec![TransactionsFromNodeResponse {
+                chain_id: version as u32,
+                ..Default::default()
+            }],
+            std::time::Instant::now(),
+            version,
+            version,
+        )
+    }
+
+    #[tokio::test]
+    async fn sends_first_batch_before_later_conversion_finishes() {
+        let (release, wait) = oneshot::channel();
+        let tasks = vec![
+            tokio::spawn(async { batch(1) }),
+            tokio::spawn(async {
+                wait.await.unwrap();
+                batch(2)
+            }),
+        ];
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            send_ordered_batches(tasks, &tx, std::time::Instant::now()).await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .chain_id,
+            1
+        );
+        release.send(()).unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 2);
+        assert!(worker.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn keeps_order_when_later_task_finishes_first() {
+        let (release, wait) = oneshot::channel();
+        let later = tokio::spawn(async { batch(2) });
+        let later_batch = later.await.unwrap();
+        let tasks = vec![
+            tokio::spawn(async {
+                wait.await.unwrap();
+                batch(1)
+            }),
+            tokio::spawn(async move { later_batch }),
+        ];
+        let (tx, mut rx) = mpsc::channel(1);
+        let started = std::time::Instant::now() - Duration::from_secs(1);
+        let worker = tokio::spawn(async move { send_ordered_batches(tasks, &tx, started).await });
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 1);
+        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 2);
+        assert!(worker.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reports_failure_after_delivered_prefix() {
+        let tasks = vec![
+            tokio::spawn(async { batch(1) }),
+            tokio::spawn(async { panic!("conversion failed") }),
+            tokio::spawn(async { batch(3) }),
+        ];
+        let (tx, mut rx) = mpsc::channel(4);
+        let result = send_ordered_batches(tasks, &tx, std::time::Instant::now()).await;
+        assert!(result.is_err());
+        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 1);
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap_err().code(),
+            tonic::Code::Internal
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnect_does_not_wait_for_conversion() {
+        let task = tokio::spawn(std::future::pending::<ConvertedBatch>());
+        let abort = task.abort_handle();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_ordered_batches(vec![task], &tx, std::time::Instant::now()),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap().is_none());
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn preserves_chunks_and_empty_filtered_batches_under_backpressure() {
+        let started = std::time::Instant::now();
+        let tasks = vec![
+            tokio::spawn(async { (vec![], std::time::Instant::now(), 0, 0) }),
+            tokio::spawn(async {
+                let mut first = batch(1);
+                first.0.extend(batch(2).0);
+                first.3 = 2;
+                first
+            }),
+            tokio::spawn(async { batch(3) }),
+        ];
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move { send_ordered_batches(tasks, &tx, started).await });
+        for version in 1..=3 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .chain_id,
+                version
+            );
+        }
+        assert!(worker.await.unwrap().unwrap().is_some());
+        assert!(rx.recv().await.is_none());
     }
 }
