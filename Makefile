@@ -1,5 +1,5 @@
 build_node:
-	cargo build --profile performance -p aptos-node
+	touch crates/aptos-build-info/build.rs && cargo build --profile performance -p aptos-node
 
 install_aptos:
 	sudo cp target/performance/aptos-node /opt/aptos/bin/

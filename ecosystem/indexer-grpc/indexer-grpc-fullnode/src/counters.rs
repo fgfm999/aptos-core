@@ -33,3 +33,16 @@ pub static LATENCY_MS: Lazy<IntGauge> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+/// One sample per successfully converted task, using sizes already computed for the response.
+pub fn observe_api_conversion_work(kind: &'static str, value: u64) {
+    static WORK: Lazy<aptos_metrics_core::HistogramVec> = Lazy::new(|| {
+        aptos_metrics_core::register_histogram_vec!(
+            "indexer_grpc_api_conversion_work",
+            "Work per successful API conversion task; byte fields are component sizes, not wire size",
+            &["kind"],
+            vec![1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0]
+        ).unwrap()
+    });
+    WORK.with_label_values(&[kind]).observe(value as f64);
+}

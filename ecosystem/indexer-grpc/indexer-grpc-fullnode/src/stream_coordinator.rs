@@ -3,7 +3,7 @@
 
 use crate::{
     convert::convert_transaction,
-    counters::UNABLE_TO_FETCH_TRANSACTION,
+    counters::{observe_api_conversion_work, UNABLE_TO_FETCH_TRANSACTION},
     runtime::{DEFAULT_NUM_RETRIES, RETRY_TIME_MILLIS},
 };
 use aptos_api::context::Context;
@@ -465,8 +465,13 @@ impl IndexerStreamCoordinator {
         let start_millis = chrono::Utc::now().naive_utc();
 
         let first_version = raw_txns.first().map(|txn| txn.version).unwrap();
+        let last_version = raw_txns.last().unwrap().version;
+        let num_transactions = raw_txns.len() as u64;
+        let setup_start = std::time::Instant::now();
         let state_view = context.latest_state_view().unwrap();
         let converter = state_view.as_converter(context.db.clone(), context.indexer_reader.clone());
+        let setup_duration = setup_start.elapsed();
+        let block_start = std::time::Instant::now();
 
         // Enrich data with block metadata
         let (_, _, block_event) = context
@@ -478,6 +483,8 @@ impl IndexerStreamCoordinator {
                     first_version,
                 )
             });
+        let block_duration = block_start.elapsed();
+        let mut metadata_start = std::time::Instant::now();
         let mut timestamp = block_event.proposed_time();
         let mut epoch = block_event.epoch();
         let mut epoch_bcs = aptos_api_types::U64::from(epoch);
@@ -485,7 +492,18 @@ impl IndexerStreamCoordinator {
         let mut block_height_bcs = aptos_api_types::U64::from(block_height);
 
         let mut transactions = vec![];
+        let mut metadata_duration = metadata_start.elapsed();
+        let mut size_duration = Duration::ZERO;
+        let mut content_duration = Duration::ZERO;
+        let mut assembly_duration = Duration::ZERO;
+        let mut accounting_duration = Duration::ZERO;
+        let mut transaction_bytes = 0u64;
+        let mut event_bytes = 0u64;
+        let mut write_bytes = 0u64;
+        let mut events = 0u64;
+        let mut writes = 0u64;
         for (ind, raw_txn) in raw_txns.into_iter().enumerate() {
+            metadata_start = std::time::Instant::now();
             let txn_version = raw_txn.version;
             // Do not update block_height if first block is block metadata
             if ind > 0 {
@@ -504,44 +522,64 @@ impl IndexerStreamCoordinator {
                     block_height_bcs = aptos_api_types::U64::from(block_height);
                 }
             }
+            metadata_duration += metadata_start.elapsed();
+            let size_start = std::time::Instant::now();
             let size_info = Self::get_size_info(&raw_txn);
-            let res = converter
-                .try_into_onchain_transaction(timestamp, raw_txn)
-                .map(|mut txn| {
-                    match txn {
-                        APITransaction::PendingTransaction(_) => {
-                            unreachable!(
-                                "[Indexer Fullnode] Indexer should never see pending transactions"
-                            )
-                        },
-                        APITransaction::UserTransaction(ref mut ut) => {
-                            ut.info.block_height = Some(block_height_bcs);
-                            ut.info.epoch = Some(epoch_bcs);
-                        },
-                        APITransaction::GenesisTransaction(ref mut gt) => {
-                            gt.info.block_height = Some(block_height_bcs);
-                            gt.info.epoch = Some(epoch_bcs);
-                        },
-                        APITransaction::BlockMetadataTransaction(ref mut bmt) => {
-                            bmt.info.block_height = Some(block_height_bcs);
-                            bmt.info.epoch = Some(epoch_bcs);
-                        },
-                        APITransaction::StateCheckpointTransaction(ref mut sct) => {
-                            sct.info.block_height = Some(block_height_bcs);
-                            sct.info.epoch = Some(epoch_bcs);
-                        },
-                        APITransaction::BlockEpilogueTransaction(ref mut bet) => {
-                            bet.info.block_height = Some(block_height_bcs);
-                            bet.info.epoch = Some(epoch_bcs);
-                        },
-                        APITransaction::ValidatorTransaction(ref mut vt) => {
-                            let info = vt.transaction_info_mut();
-                            info.block_height = Some(block_height_bcs);
-                            info.epoch = Some(epoch_bcs);
-                        },
-                    };
-                    txn
-                });
+            size_duration += size_start.elapsed();
+            let accounting_start = std::time::Instant::now();
+            transaction_bytes += u64::from(size_info.transaction_bytes);
+            events += size_info.event_size_info.len() as u64;
+            writes += size_info.write_op_size_info.len() as u64;
+            event_bytes += size_info
+                .event_size_info
+                .iter()
+                .map(|event| u64::from(event.total_bytes))
+                .sum::<u64>();
+            write_bytes += size_info
+                .write_op_size_info
+                .iter()
+                .map(|write| u64::from(write.key_bytes) + u64::from(write.value_bytes))
+                .sum::<u64>();
+            accounting_duration += accounting_start.elapsed();
+            let content_start = std::time::Instant::now();
+            let converted = converter.try_into_onchain_transaction(timestamp, raw_txn);
+            content_duration += content_start.elapsed();
+            let assembly_start = std::time::Instant::now();
+            let res = converted.map(|mut txn| {
+                match txn {
+                    APITransaction::PendingTransaction(_) => {
+                        unreachable!(
+                            "[Indexer Fullnode] Indexer should never see pending transactions"
+                        )
+                    },
+                    APITransaction::UserTransaction(ref mut ut) => {
+                        ut.info.block_height = Some(block_height_bcs);
+                        ut.info.epoch = Some(epoch_bcs);
+                    },
+                    APITransaction::GenesisTransaction(ref mut gt) => {
+                        gt.info.block_height = Some(block_height_bcs);
+                        gt.info.epoch = Some(epoch_bcs);
+                    },
+                    APITransaction::BlockMetadataTransaction(ref mut bmt) => {
+                        bmt.info.block_height = Some(block_height_bcs);
+                        bmt.info.epoch = Some(epoch_bcs);
+                    },
+                    APITransaction::StateCheckpointTransaction(ref mut sct) => {
+                        sct.info.block_height = Some(block_height_bcs);
+                        sct.info.epoch = Some(epoch_bcs);
+                    },
+                    APITransaction::BlockEpilogueTransaction(ref mut bet) => {
+                        bet.info.block_height = Some(block_height_bcs);
+                        bet.info.epoch = Some(epoch_bcs);
+                    },
+                    APITransaction::ValidatorTransaction(ref mut vt) => {
+                        let info = vt.transaction_info_mut();
+                        info.block_height = Some(block_height_bcs);
+                        info.epoch = Some(epoch_bcs);
+                    },
+                };
+                txn
+            });
             match res {
                 Ok(transaction) => transactions.push((transaction, size_info)),
                 Err(err) => {
@@ -559,7 +597,41 @@ impl IndexerStreamCoordinator {
                     );
                 },
             }
+            assembly_duration += assembly_start.elapsed();
         }
+
+        for (stage, elapsed) in [
+            ("api_setup", setup_duration),
+            ("api_block_metadata_read", block_duration),
+            ("api_metadata_tracking", metadata_duration),
+            ("api_size_calculation", size_duration),
+            ("api_transaction_conversion", content_duration),
+            ("api_result_assembly", assembly_duration),
+            ("api_work_accounting", accounting_duration),
+        ] {
+            observe_indexer_stage(stage, first_version, last_version, elapsed);
+        }
+        for (kind, count) in [
+            ("transactions", num_transactions),
+            ("events", events),
+            ("write_ops", writes),
+            ("transaction_bytes", transaction_bytes),
+            ("event_bytes", event_bytes),
+            ("write_bytes", write_bytes),
+        ] {
+            observe_api_conversion_work(kind, count);
+        }
+        aptos_logger::debug!(
+            start_version = first_version,
+            end_version = last_version,
+            transactions = num_transactions,
+            events = events,
+            write_ops = writes,
+            transaction_bytes = transaction_bytes,
+            event_bytes = event_bytes,
+            write_bytes = write_bytes,
+            "Indexer API conversion workload"
+        );
 
         if transactions.is_empty() {
             panic!("[Indexer Fullnode] No transactions!");
