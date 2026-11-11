@@ -4,6 +4,7 @@
 use crate::{
     convert::convert_transaction,
     counters::{observe_api_conversion_work, UNABLE_TO_FETCH_TRANSACTION},
+    raw_filter::{Decision, RawFilter},
     runtime::{DEFAULT_NUM_RETRIES, RETRY_TIME_MILLIS},
 };
 use aptos_api::context::Context;
@@ -194,10 +195,12 @@ impl IndexerStreamCoordinator {
         let output_batch_size = self.output_batch_size;
         let ledger_chain_id = self.context.chain_id().id();
         let filter = self.filter.clone();
+        let raw_filter = self.filter.as_ref().map(RawFilter::new).map(Arc::new);
         let mut tasks = vec![];
         for batch in task_batches {
             let context = self.context.clone();
             let filter = filter.clone();
+            let raw_filter = raw_filter.clone();
             let queued_at = std::time::Instant::now();
             let task = tokio::task::spawn_blocking(move || {
                 let start_version = batch.first().unwrap().version;
@@ -210,7 +213,7 @@ impl IndexerStreamCoordinator {
                 );
                 let api_start = std::time::Instant::now();
                 let raw_txns = batch;
-                let api_txns = Self::convert_to_api_txns(context, raw_txns);
+                let api_txns = Self::convert_to_api_txns(context, raw_txns, raw_filter.as_deref());
                 observe_indexer_stage(
                     "api_conversion",
                     start_version,
@@ -226,15 +229,14 @@ impl IndexerStreamCoordinator {
                     pb_start.elapsed(),
                 );
                 let response_start = std::time::Instant::now();
-                // Apply filter if present.
-                let pb_txns = if let Some(ref filter) = filter {
-                    pb_txns
-                        .into_iter()
-                        .filter(|txn| filter.matches(txn))
-                        .collect::<Vec<_>>()
-                } else {
-                    pb_txns
-                };
+                let pb_txns = pb_txns
+                    .into_iter()
+                    .filter_map(|(txn, decision)| {
+                        decision
+                            .resolve(|| filter.as_ref().is_none_or(|filter| filter.matches(&txn)))
+                            .then_some(txn)
+                    })
+                    .collect();
                 let responses = responses_with_ranges(
                     pb_txns,
                     start_version,
@@ -467,7 +469,8 @@ impl IndexerStreamCoordinator {
     fn convert_to_api_txns(
         context: Arc<Context>,
         raw_txns: Vec<TransactionOnChainData>,
-    ) -> Vec<(APITransaction, TransactionSizeInfo)> {
+        raw_filter: Option<&RawFilter>,
+    ) -> Vec<(APITransaction, TransactionSizeInfo, Decision)> {
         if raw_txns.is_empty() {
             return vec![];
         }
@@ -506,6 +509,8 @@ impl IndexerStreamCoordinator {
         let mut content_duration = Duration::ZERO;
         let mut assembly_duration = Duration::ZERO;
         let mut accounting_duration = Duration::ZERO;
+        let mut prefilter_duration = Duration::ZERO;
+        let mut skipped = 0u64;
         let mut transaction_bytes = 0u64;
         let mut event_bytes = 0u64;
         let mut write_bytes = 0u64;
@@ -532,6 +537,13 @@ impl IndexerStreamCoordinator {
                 }
             }
             metadata_duration += metadata_start.elapsed();
+            let filter_start = std::time::Instant::now();
+            let decision = raw_filter.map_or(Decision::Match, |filter| filter.evaluate(&raw_txn));
+            prefilter_duration += filter_start.elapsed();
+            if decision == Decision::NoMatch {
+                skipped += 1;
+                continue;
+            }
             let size_start = std::time::Instant::now();
             let size_info = Self::get_size_info(&raw_txn);
             size_duration += size_start.elapsed();
@@ -590,7 +602,7 @@ impl IndexerStreamCoordinator {
                 txn
             });
             match res {
-                Ok(transaction) => transactions.push((transaction, size_info)),
+                Ok(transaction) => transactions.push((transaction, size_info, decision)),
                 Err(err) => {
                     UNABLE_TO_FETCH_TRANSACTION.inc();
                     error!(
@@ -610,6 +622,7 @@ impl IndexerStreamCoordinator {
         }
 
         for (stage, elapsed) in [
+            ("api_prefilter", prefilter_duration),
             ("api_setup", setup_duration),
             ("api_block_metadata_read", block_duration),
             ("api_metadata_tracking", metadata_duration),
@@ -622,6 +635,8 @@ impl IndexerStreamCoordinator {
         }
         for (kind, count) in [
             ("transactions", num_transactions),
+            ("converted_transactions", num_transactions - skipped),
+            ("prefilter_skipped", skipped),
             ("events", events),
             ("write_ops", writes),
             ("transaction_bytes", transaction_bytes),
@@ -642,18 +657,11 @@ impl IndexerStreamCoordinator {
             "Indexer API conversion workload"
         );
 
-        if transactions.is_empty() {
-            panic!("[Indexer Fullnode] No transactions!");
-        }
-
         let fetch_millis = (chrono::Utc::now().naive_utc() - start_millis).num_milliseconds();
 
         info!(
             start_version = first_version,
-            end_version = transactions
-                .last()
-                .map(|(txn, _size_info)| txn.version().unwrap())
-                .unwrap_or(0),
+            end_version = last_version,
             num_of_transactions = transactions.len(),
             fetch_duration_in_ms = fetch_millis,
             service_type = SERVICE_TYPE,
@@ -690,18 +698,19 @@ impl IndexerStreamCoordinator {
     }
 
     fn convert_to_pb_txns(
-        api_txns: Vec<(APITransaction, TransactionSizeInfo)>,
-    ) -> Vec<TransactionPB> {
+        api_txns: Vec<(APITransaction, TransactionSizeInfo, Decision)>,
+    ) -> Vec<(TransactionPB, Decision)> {
         api_txns
             .into_iter()
-            .map(|(txn, size_info)| {
+            .map(|(txn, size_info, decision)| {
                 let info = txn.transaction_info().unwrap();
-                convert_transaction(
+                let converted = convert_transaction(
                     &txn,
                     info.block_height.unwrap().0,
                     info.epoch.unwrap().0,
                     size_info,
-                )
+                );
+                (converted, decision)
             })
             .collect()
     }
