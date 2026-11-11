@@ -23,6 +23,7 @@ use futures::StreamExt;
 pub struct ConsensusObserverNetworkMessage {
     peer_network_id: PeerNetworkId,
     message: ConsensusObserverDirectSend,
+    received_at: (std::time::Instant, std::time::SystemTime),
 }
 
 impl ConsensusObserverNetworkMessage {
@@ -30,7 +31,13 @@ impl ConsensusObserverNetworkMessage {
         Self {
             peer_network_id,
             message,
+            received_at: (std::time::Instant::now(), std::time::SystemTime::now()),
         }
+    }
+
+    /// Application ingress after network decoding, before the observer queue.
+    pub fn received_at(&self) -> (std::time::Instant, std::time::SystemTime) {
+        self.received_at
     }
 
     /// Consumes and unpacks the message into its parts

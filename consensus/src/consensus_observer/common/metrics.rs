@@ -325,3 +325,78 @@ pub fn set_gauge(counter: &Lazy<IntGaugeVec>, network_id: &NetworkId, value: i64
 pub fn set_gauge_with_label(counter: &Lazy<IntGaugeVec>, label: &str, value: u64) {
     counter.with_label_values(&[label]).set(value as i64);
 }
+
+/// After network decoding to observer handler entry, measured with a monotonic clock.
+pub static OBSERVER_INGRESS_QUEUE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "consensus_observer_ingress_queue_seconds",
+        "Decoded message enqueue to observer handler entry, for subscribed peers including duplicates",
+        &["message_type"],
+        exponential_buckets(0.000001, 2.0, 25).unwrap()
+    ).unwrap()
+});
+
+/// Timestamp age at ingress for accepted, non-stale, non-duplicate current-epoch payloads.
+pub static OBSERVER_PAYLOAD_ARRIVAL_AGE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "consensus_observer_payload_arrival_age_seconds",
+        "Block timestamp to decoded payload ingress, sampled after acceptance; affected by clock skew",
+        &["message_type"],
+        exponential_buckets(0.00001, 2.0, 25).unwrap()
+    ).unwrap()
+});
+
+pub static OBSERVER_PAYLOAD_ARRIVAL_CLOCK_ERRORS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "consensus_observer_payload_arrival_clock_errors_total",
+        "Accepted payload samples excluded because block timestamp is after ingress wall time"
+    )
+    .unwrap()
+});
+
+fn payload_arrival_age(
+    received_at: std::time::SystemTime,
+    block_timestamp_usecs: u64,
+) -> Option<std::time::Duration> {
+    received_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .checked_sub(std::time::Duration::from_micros(block_timestamp_usecs))
+}
+
+pub fn observe_payload_arrival(received_at: std::time::SystemTime, block_timestamp_usecs: u64) {
+    if let Some(age) = payload_arrival_age(received_at, block_timestamp_usecs) {
+        OBSERVER_PAYLOAD_ARRIVAL_AGE_SECONDS
+            .with_label_values(&[BLOCK_PAYLOAD_LABEL])
+            .observe(age.as_secs_f64());
+    } else {
+        OBSERVER_PAYLOAD_ARRIVAL_CLOCK_ERRORS.inc();
+    }
+}
+
+#[cfg(test)]
+mod arrival_timing_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn measures_age_at_saved_ingress_not_later_processing() {
+        let ingress = UNIX_EPOCH + Duration::from_micros(1_150_000);
+        assert_eq!(
+            payload_arrival_age(ingress, 1_000_000),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            payload_arrival_age(ingress, 1_150_000),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn future_block_timestamp_does_not_become_zero_latency() {
+        assert_eq!(
+            payload_arrival_age(UNIX_EPOCH + Duration::from_secs(1), 1_000_001),
+            None
+        );
+    }
+}

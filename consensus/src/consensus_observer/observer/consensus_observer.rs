@@ -373,6 +373,7 @@ impl ConsensusObserver {
         peer_network_id: PeerNetworkId,
         message_received_time: Instant,
         block_payload: BlockPayload,
+        payload_received_at: std::time::SystemTime,
     ) {
         // Get the epoch and round for the block
         let block_epoch = block_payload.epoch();
@@ -433,6 +434,15 @@ impl ConsensusObserver {
         } else {
             false // We can't verify the signatures yet
         };
+
+        // Existing stale/duplicate checks and proof verification above select the first
+        // accepted current-epoch payload. Use its ingress time, not verification time.
+        if verified_payload {
+            metrics::observe_payload_arrival(
+                payload_received_at,
+                block_payload.block().timestamp_usecs(),
+            );
+        }
 
         // Update the latency metrics for block payload processing
         update_message_processing_latency_metrics(
@@ -597,6 +607,8 @@ impl ConsensusObserver {
     async fn process_network_message(&mut self, network_message: ConsensusObserverNetworkMessage) {
         // Unpack the network message and note the received time
         let message_received_time = Instant::now();
+        let (ingress_instant, ingress_wall_time) = network_message.received_at();
+        let queue_duration = message_received_time.duration_since(ingress_instant);
         let (peer_network_id, message) = network_message.into_parts();
 
         // Verify the message is from the peers we've subscribed to
@@ -616,6 +628,12 @@ impl ConsensusObserver {
             );
             return;
         }
+
+        // Queue latency includes duplicates from subscribed peers; arrival age below
+        // only counts payloads that pass the existing acceptance checks.
+        metrics::OBSERVER_INGRESS_QUEUE_SECONDS
+            .with_label_values(&[message.get_label()])
+            .observe(queue_duration.as_secs_f64());
 
         // Increment the received message counter
         increment_received_message_counter(&peer_network_id, &message);
@@ -642,6 +660,7 @@ impl ConsensusObserver {
                     peer_network_id,
                     message_received_time,
                     block_payload,
+                    ingress_wall_time,
                 )
                 .await;
             },
