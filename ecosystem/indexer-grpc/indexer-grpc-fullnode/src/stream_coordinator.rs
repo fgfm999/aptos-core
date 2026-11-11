@@ -15,6 +15,7 @@ use aptos_indexer_grpc_utils::{
 };
 use aptos_logger::{error, info, sample, sample::SampleRate, warn};
 use aptos_protos::{
+    indexer::v1::ProcessedRange,
     internal::fullnode::v1::{
         transactions_from_node_response, TransactionsFromNodeResponse, TransactionsOutput,
     },
@@ -38,6 +39,21 @@ use tonic::Status;
 
 type EndVersion = u64;
 
+#[derive(Debug)]
+pub struct StreamResponse {
+    pub response: TransactionsFromNodeResponse,
+    pub processed_range: Option<ProcessedRange>,
+}
+
+impl From<TransactionsFromNodeResponse> for StreamResponse {
+    fn from(response: TransactionsFromNodeResponse) -> Self {
+        Self {
+            response,
+            processed_range: None,
+        }
+    }
+}
+
 /// Checks if an error message indicates that the requested version has been pruned.
 fn is_pruned_error(err: &anyhow::Error) -> bool {
     let err_str = err.to_string();
@@ -56,7 +72,7 @@ pub struct IndexerStreamCoordinator {
     pub output_batch_size: u16,
     pub highest_known_version: u64,
     pub context: Arc<Context>,
-    pub transactions_sender: mpsc::Sender<Result<TransactionsFromNodeResponse, tonic::Status>>,
+    pub transactions_sender: mpsc::Sender<Result<StreamResponse, tonic::Status>>,
     pub filter: Option<BooleanTransactionFilter>,
     abort_handle: Option<Arc<AtomicBool>>,
     wait_stage: &'static str,
@@ -79,7 +95,7 @@ impl IndexerStreamCoordinator {
         processor_task_count: u16,
         processor_batch_size: u16,
         output_batch_size: u16,
-        transactions_sender: mpsc::Sender<Result<TransactionsFromNodeResponse, tonic::Status>>,
+        transactions_sender: mpsc::Sender<Result<StreamResponse, tonic::Status>>,
         filter: Option<BooleanTransactionFilter>,
         abort_handle: Option<Arc<AtomicBool>>,
     ) -> Self {
@@ -219,21 +235,14 @@ impl IndexerStreamCoordinator {
                 } else {
                     pb_txns
                 };
-                let mut responses = vec![];
-                // Wrap in stream response object and send to channel
-                for chunk in pb_txns.chunks(output_batch_size as usize) {
-                    for chunk in chunk_transactions(chunk.to_vec(), MESSAGE_SIZE_LIMIT) {
-                        let item = TransactionsFromNodeResponse {
-                            response: Some(transactions_from_node_response::Response::Data(
-                                TransactionsOutput {
-                                    transactions: chunk,
-                                },
-                            )),
-                            chain_id: ledger_chain_id as u32,
-                        };
-                        responses.push(item);
-                    }
-                }
+                let responses = responses_with_ranges(
+                    pb_txns,
+                    start_version,
+                    end_version,
+                    output_batch_size as usize,
+                    ledger_chain_id as u32,
+                    MESSAGE_SIZE_LIMIT,
+                );
                 observe_indexer_stage(
                     "filter_and_chunk",
                     start_version,
@@ -777,12 +786,7 @@ impl IndexerStreamCoordinator {
     }
 }
 
-type ConvertedBatch = (
-    Vec<TransactionsFromNodeResponse>,
-    std::time::Instant,
-    u64,
-    u64,
-);
+type ConvertedBatch = (Vec<StreamResponse>, std::time::Instant, u64, u64);
 
 struct ConversionTasks(Vec<tokio::task::JoinHandle<ConvertedBatch>>);
 
@@ -797,7 +801,7 @@ impl Drop for ConversionTasks {
 
 async fn send_ordered_batches(
     tasks: Vec<tokio::task::JoinHandle<ConvertedBatch>>,
-    sender: &mpsc::Sender<Result<TransactionsFromNodeResponse, Status>>,
+    sender: &mpsc::Sender<Result<StreamResponse, Status>>,
     conversion_started: std::time::Instant,
 ) -> Result<Option<(Duration, Duration)>, Status> {
     let mut tasks = ConversionTasks(tasks);
@@ -850,7 +854,8 @@ mod ordered_delivery_tests {
             vec![TransactionsFromNodeResponse {
                 chain_id: version as u32,
                 ..Default::default()
-            }],
+            }
+            .into()],
             std::time::Instant::now(),
             version,
             version,
@@ -877,11 +882,12 @@ mod ordered_delivery_tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
+                .response
                 .chain_id,
             1
         );
         release.send(()).unwrap();
-        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 2);
+        assert_eq!(rx.recv().await.unwrap().unwrap().response.chain_id, 2);
         assert!(worker.await.unwrap().unwrap().is_some());
     }
 
@@ -903,8 +909,8 @@ mod ordered_delivery_tests {
         tokio::task::yield_now().await;
         assert!(rx.try_recv().is_err());
         release.send(()).unwrap();
-        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 1);
-        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 2);
+        assert_eq!(rx.recv().await.unwrap().unwrap().response.chain_id, 1);
+        assert_eq!(rx.recv().await.unwrap().unwrap().response.chain_id, 2);
         assert!(worker.await.unwrap().unwrap().is_some());
     }
 
@@ -918,7 +924,7 @@ mod ordered_delivery_tests {
         let (tx, mut rx) = mpsc::channel(4);
         let result = send_ordered_batches(tasks, &tx, std::time::Instant::now()).await;
         assert!(result.is_err());
-        assert_eq!(rx.recv().await.unwrap().unwrap().chain_id, 1);
+        assert_eq!(rx.recv().await.unwrap().unwrap().response.chain_id, 1);
         assert_eq!(
             rx.recv().await.unwrap().unwrap_err().code(),
             tonic::Code::Internal
@@ -965,11 +971,145 @@ mod ordered_delivery_tests {
                     .unwrap()
                     .unwrap()
                     .unwrap()
+                    .response
                     .chain_id,
                 version
             );
         }
         assert!(worker.await.unwrap().unwrap().is_some());
         assert!(rx.recv().await.is_none());
+    }
+}
+
+fn responses_with_ranges(
+    transactions: Vec<TransactionPB>,
+    first_version: u64,
+    last_version: u64,
+    output_batch_size: usize,
+    chain_id: u32,
+    message_size_limit: usize,
+) -> Vec<StreamResponse> {
+    let mut next_version = first_version;
+    let mut responses = vec![];
+    for chunk in transactions.chunks(output_batch_size) {
+        for chunk in chunk_transactions(chunk.to_vec(), message_size_limit) {
+            let end = chunk.last().unwrap().version;
+            responses.push(StreamResponse {
+                response: TransactionsFromNodeResponse {
+                    chain_id,
+                    response: Some(transactions_from_node_response::Response::Data(
+                        TransactionsOutput {
+                            transactions: chunk,
+                        },
+                    )),
+                },
+                processed_range: Some(ProcessedRange {
+                    first_version: next_version,
+                    last_version: end,
+                }),
+            });
+            next_version = end + 1;
+        }
+    }
+    if let Some(last) = responses.last_mut() {
+        last.processed_range.as_mut().unwrap().last_version = last_version;
+    } else {
+        responses.push(StreamResponse {
+            response: TransactionsFromNodeResponse {
+                chain_id,
+                response: Some(transactions_from_node_response::Response::Data(
+                    TransactionsOutput {
+                        transactions: vec![],
+                    },
+                )),
+            },
+            processed_range: Some(ProcessedRange {
+                first_version,
+                last_version,
+            }),
+        });
+    }
+    responses
+}
+
+#[cfg(test)]
+mod processed_range_tests {
+    use super::*;
+
+    fn transactions(versions: &[u64]) -> Vec<TransactionPB> {
+        versions
+            .iter()
+            .map(|v| TransactionPB {
+                version: *v,
+                ..Default::default()
+            })
+            .collect()
+    }
+    fn ranges(responses: &[StreamResponse]) -> Vec<(u64, u64)> {
+        responses
+            .iter()
+            .map(|r| {
+                let r = r.processed_range.as_ref().unwrap();
+                (r.first_version, r.last_version)
+            })
+            .collect()
+    }
+    #[test]
+    fn filtered_final_chunk_includes_scanned_tail() {
+        let responses = responses_with_ranges(
+            transactions(&[102, 105, 108]),
+            100,
+            110,
+            2,
+            1,
+            MESSAGE_SIZE_LIMIT,
+        );
+        assert_eq!(ranges(&responses), vec![(100, 105), (106, 110)]);
+        let data: Vec<_> = responses
+            .into_iter()
+            .flat_map(|r| match r.response.response.unwrap() {
+                transactions_from_node_response::Response::Data(d) => d
+                    .transactions
+                    .into_iter()
+                    .map(|t| t.version)
+                    .collect::<Vec<_>>(),
+                _ => panic!("expected data"),
+            })
+            .collect();
+        assert_eq!(data, vec![102, 105, 108]);
+    }
+    #[test]
+    fn all_filtered_still_returns_original_range() {
+        let responses = responses_with_ranges(vec![], 100, 110, 2, 1, MESSAGE_SIZE_LIMIT);
+        assert_eq!(ranges(&responses), vec![(100, 110)]);
+        match responses[0].response.response.as_ref().unwrap() {
+            transactions_from_node_response::Response::Data(d) => {
+                assert!(d.transactions.is_empty())
+            },
+            _ => panic!("expected data"),
+        }
+    }
+    #[test]
+    fn byte_splitting_preserves_original_scanned_range() {
+        let responses = responses_with_ranges(transactions(&[102, 105, 108]), 100, 110, 100, 1, 3);
+        assert!(responses.len() > 1);
+        let ranges = ranges(&responses);
+        assert_eq!(ranges.first().unwrap().0, 100);
+        assert_eq!(ranges.last().unwrap().1, 110);
+        assert!(ranges.windows(2).all(|w| w[0].1 + 1 == w[1].0));
+    }
+    #[test]
+    fn adjacent_tasks_publish_independent_ranges() {
+        let mut responses =
+            responses_with_ranges(transactions(&[102]), 100, 105, 2, 1, MESSAGE_SIZE_LIMIT);
+        responses.extend(responses_with_ranges(
+            vec![],
+            106,
+            110,
+            2,
+            1,
+            MESSAGE_SIZE_LIMIT,
+        ));
+        assert_eq!(ranges(&responses), vec![(100, 105), (106, 110)]);
     }
 }
