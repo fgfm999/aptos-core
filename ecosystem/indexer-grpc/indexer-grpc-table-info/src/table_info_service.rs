@@ -24,7 +24,7 @@ use std::{
 };
 
 type EndVersion = u64;
-const LEDGER_VERSION_RETRY_TIME_MILLIS: u64 = 10;
+const LEDGER_VERSION_RETRY_TIME_MILLIS: u64 = 1;
 const TABLE_INFO_SNAPSHOT_CHECK_INTERVAL_IN_SECS: u64 = 5;
 const SERVICE_TYPE: &str = "table_info_service";
 
