@@ -1596,11 +1596,14 @@ where
                 .collect::<Vec<_>>(),
         );
 
-        let block_limit_processor = ExplicitSyncWrapper::new(BlockGasLimitProcessor::new(
-            self.config.onchain.block_gas_limit_type,
-            self.config.onchain.block_gas_limit_override(),
-            num_txns,
-        ));
+        let block_limit_processor = ExplicitSyncWrapper::new(
+            BlockGasLimitProcessor::new(
+                self.config.onchain.block_gas_limit_type,
+                self.config.onchain.block_gas_limit_override(),
+                num_txns,
+            )
+            .with_transaction_slice_metadata(transaction_slice_metadata),
+        );
         let block_epilogue_txn_idx = ExplicitSyncWrapper::new(None);
         let num_txns = num_txns as u32;
 
@@ -1790,11 +1793,14 @@ where
         }
 
         let num_workers = self.config.local.concurrency_level.min(num_txns / 2).max(2);
-        let block_limit_processor = ExplicitSyncWrapper::new(BlockGasLimitProcessor::new(
-            self.config.onchain.block_gas_limit_type,
-            self.config.onchain.block_gas_limit_override(),
-            num_txns + 1,
-        ));
+        let block_limit_processor = ExplicitSyncWrapper::new(
+            BlockGasLimitProcessor::new(
+                self.config.onchain.block_gas_limit_type,
+                self.config.onchain.block_gas_limit_override(),
+                num_txns + 1,
+            )
+            .with_transaction_slice_metadata(transaction_slice_metadata),
+        );
         let shared_maybe_error = AtomicBool::new(false);
 
         let final_results = ExplicitSyncWrapper::new(
@@ -2119,7 +2125,8 @@ where
             self.config.onchain.block_gas_limit_type,
             self.config.onchain.block_gas_limit_override(),
             num_txns + 1,
-        );
+        )
+        .with_transaction_slice_metadata(transaction_slice_metadata);
 
         let mut block_epilogue_txn = None;
         // Counts user-txn `accumulate_fee_statement` calls. Incremented alongside each

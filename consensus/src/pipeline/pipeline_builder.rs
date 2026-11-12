@@ -833,13 +833,34 @@ impl PipelineBuilder {
         parent_block_execute_fut.await?;
         let (user_txns, _, _) = prepare_fut.await?;
 
+        crate::consensus_observer::common::timeline::record(
+            "rand_check_start",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         tracker.start_working();
         if !is_randomness_enabled {
+            crate::consensus_observer::common::timeline::record(
+                "rand_check_done",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
             return Ok(false);
         }
         // When rand_check is disabled (e.g. rolling deployment), report all blocks as
         // needing randomness so aggregation always runs and produces real randomness.
         if !rand_check_enabled {
+            crate::consensus_observer::common::timeline::record(
+                "rand_check_done",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
             return Ok(true);
         }
         let grand_parent_id = block.quorum_cert().parent_block().id();
@@ -910,6 +931,13 @@ impl PipelineBuilder {
                 block.round()
             );
         }
+        crate::consensus_observer::common::timeline::record(
+            "rand_check_done",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         Ok(need_randomness)
     }
 
@@ -926,10 +954,28 @@ impl PipelineBuilder {
         let maybe_rand = if !need_randomness {
             None
         } else {
+            crate::consensus_observer::common::timeline::record(
+                "randomness_wait_start",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
             rand_rx
                 .await
                 .map_err(|_| anyhow!("randomness tx cancelled"))?
         };
+        crate::consensus_observer::common::timeline::record(
+            if need_randomness {
+                "randomness_ready"
+            } else {
+                "randomness_not_required"
+            },
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         Ok((Some(maybe_rand), need_randomness))
     }
 
@@ -947,6 +993,13 @@ impl PipelineBuilder {
     ) -> TaskResult<ExecuteResult> {
         let mut tracker = Tracker::start_waiting("execute", &block);
         parent_block_execute_fut.await?;
+        crate::consensus_observer::common::timeline::record(
+            "parent_execute_ready",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         let (user_txns, block_gas_limit, decryption_outcome) = prepare_fut.await?;
         let onchain_execution_config =
             onchain_execution_config.with_block_gas_limit_override(block_gas_limit);

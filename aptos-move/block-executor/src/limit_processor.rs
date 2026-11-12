@@ -4,9 +4,11 @@
 use crate::{
     counters, hot_state_op_accumulator::BlockHotStateOpAccumulator, types::ReadWriteSummary,
 };
+use aptos_crypto::HashValue;
 use aptos_logger::{info, warn};
 use aptos_metrics_core::IntCounterVecHelper;
 use aptos_types::{
+    block_executor::transaction_slice_metadata::TransactionSliceMetadata,
     fee_statement::FeeStatement,
     on_chain_config::BlockGasLimitType,
     transaction::{
@@ -31,6 +33,7 @@ pub struct BlockGasLimitProcessor<T: Transaction> {
     txn_fee_statements: Vec<FeeStatement>,
     txn_read_write_summaries: Vec<ReadWriteSummary<T>>,
     start_time: Instant,
+    sampled_block_id: Option<HashValue>,
     print_conflicts_info: bool,
     hot_state_op_accumulator: Option<BlockHotStateOpAccumulator<T::Key>>,
     /// When set, `should_end_block` returned true and this label identifies which limit fired.
@@ -57,11 +60,27 @@ impl<T: Transaction> BlockGasLimitProcessor<T> {
             txn_fee_statements: Vec::with_capacity(init_size),
             txn_read_write_summaries: Vec::with_capacity(init_size),
             start_time: Instant::now(),
+            sampled_block_id: None,
             // TODO: have a configuration for it.
             print_conflicts_info: *PRINT_CONFLICTS_INFO,
             hot_state_op_accumulator,
             halted_by: None,
         }
+    }
+
+    /// Carry identity only for the observer's deterministic 1/128 block sample.
+    /// Chunk execution has no block identity and is not sampled.
+    pub(crate) fn with_transaction_slice_metadata(
+        mut self,
+        metadata: &TransactionSliceMetadata,
+    ) -> Self {
+        self.sampled_block_id = match metadata {
+            TransactionSliceMetadata::Block { child, .. } if child.as_ref()[0] & 127 == 0 => {
+                Some(*child)
+            },
+            _ => None,
+        };
+        self
     }
 
     pub(crate) fn accumulate_fee_statement(
@@ -265,6 +284,21 @@ impl<T: Transaction> BlockGasLimitProcessor<T> {
                 .observe(cut as f64);
         }
 
+        if let Some(block_id) = self.sampled_block_id {
+            info!(
+                block_id = block_id.to_hex(),
+                eff_gas = accumulated_effective_block_gas,
+                raw_gas = accumulated_raw_block_gas,
+                execution_gas = self.accumulated_fee_statement.execution_gas_used(),
+                io_gas = self.accumulated_fee_statement.io_gas_used(),
+                elapsed_us = self.start_time.elapsed().as_micros() as u64,
+                committed = num_committed,
+                total = num_total,
+                workers = num_workers,
+                parallel = is_parallel,
+                "OBSERVER_EXECUTION_STATS"
+            );
+        }
         info!(
             eff_gas = accumulated_effective_block_gas,
             raw_gas = accumulated_raw_block_gas,
@@ -364,6 +398,25 @@ mod test {
     type TestTxn = MockTransaction<KeyType<u64>, MockEvent>;
 
     type TestProcessor = BlockGasLimitProcessor<TestTxn>;
+
+    #[test]
+    fn test_observer_sampling_preserves_block_identity_and_excludes_chunks() {
+        let selected = HashValue::zero();
+        let excluded = HashValue::new([1; 32]);
+        for (metadata, expected) in [
+            (
+                TransactionSliceMetadata::block(excluded, selected),
+                Some(selected),
+            ),
+            (TransactionSliceMetadata::block(selected, excluded), None),
+            (TransactionSliceMetadata::chunk(1, 2), None),
+            (TransactionSliceMetadata::unknown(), None),
+        ] {
+            let processor = TestProcessor::new(DEFAULT_COMPLEX_LIMIT, None, 1)
+                .with_transaction_slice_metadata(&metadata);
+            assert_eq!(processor.sampled_block_id, expected);
+        }
+    }
 
     #[test]
     fn test_output_limit_not_used() {
