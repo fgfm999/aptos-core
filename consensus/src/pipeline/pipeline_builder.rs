@@ -808,6 +808,13 @@ impl PipelineBuilder {
         });
         counters::PREPARE_BLOCK_SIG_VERIFICATION_TIME
             .observe_duration(sig_verification_start.elapsed());
+        crate::consensus_observer::common::timeline::record(
+            "prepare_done",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         Ok((Arc::new(sig_verified_txns), block_gas_limit, outcome))
     }
 
@@ -946,6 +953,13 @@ impl PipelineBuilder {
 
         let (rand_result, _need_randomness) = rand_check.await?;
 
+        crate::consensus_observer::common::timeline::record(
+            "execute_ready",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         tracker.start_working();
         let metadata_txn = match (rand_result, decryption_outcome) {
             (Some(maybe_rand), DecryptionOutcome::Legacy(decryption_key)) => {
@@ -1015,13 +1029,30 @@ impl PipelineBuilder {
 
         let start = Instant::now();
         tokio::task::spawn_blocking(move || {
-            executor
+            crate::consensus_observer::common::timeline::record(
+                "execute_start",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
+            let result = executor
                 .execute_and_update_state(
                     (block.id(), txns, auxiliary_info).into(),
                     block.parent_id(),
                     onchain_execution_config,
                 )
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from);
+            if result.is_ok() {
+                crate::consensus_observer::common::timeline::record(
+                    "execute_done",
+                    block.id(),
+                    block.epoch(),
+                    block.round(),
+                    Instant::now(),
+                );
+            }
+            result
         })
         .await
         .expect("spawn blocking failed")?;
@@ -1330,13 +1361,37 @@ impl PipelineBuilder {
             return Ok(None);
         }
 
+        crate::consensus_observer::common::timeline::record(
+            "commit_ready",
+            block.id(),
+            block.epoch(),
+            block.round(),
+            Instant::now(),
+        );
         tracker.start_working();
         let block_id = block.id();
         let ledger_info_with_sigs_clone = ledger_info_with_sigs.clone();
         tokio::task::spawn_blocking(move || {
-            executor
+            crate::consensus_observer::common::timeline::record(
+                "commit_start",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
+            let result = executor
                 .commit_ledger(ledger_info_with_sigs_clone)
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from);
+            if result.is_ok() {
+                crate::consensus_observer::common::timeline::record(
+                    "commit_done",
+                    block.id(),
+                    block.epoch(),
+                    block.round(),
+                    Instant::now(),
+                );
+            }
+            result
         })
         .await
         .expect("spawn blocking failed")?;

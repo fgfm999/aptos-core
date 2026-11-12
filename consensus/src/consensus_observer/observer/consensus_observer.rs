@@ -220,6 +220,13 @@ impl ConsensusObserver {
     /// Clears the pending block state (this is useful for changing
     /// subscriptions, where we want to wipe all state and restart).
     async fn clear_pending_block_state(&self) {
+        crate::consensus_observer::common::timeline::record(
+            "state_reset",
+            aptos_crypto::HashValue::zero(),
+            0,
+            0,
+            Instant::now(),
+        );
         // Clear the observer block data
         let root = self.observer_block_data.lock().clear_block_data();
 
@@ -244,6 +251,13 @@ impl ConsensusObserver {
 
     /// Enters fallback mode for consensus observer by invoking state sync
     async fn enter_fallback_mode(&mut self) {
+        crate::consensus_observer::common::timeline::record(
+            "fallback_enter",
+            aptos_crypto::HashValue::zero(),
+            0,
+            0,
+            Instant::now(),
+        );
         // Terminate all active subscriptions (to ensure we don't process any more messages)
         self.subscription_manager.terminate_all_subscriptions();
 
@@ -288,6 +302,13 @@ impl ConsensusObserver {
         };
 
         for block in ordered_block.blocks() {
+            crate::consensus_observer::common::timeline::record(
+                "order_ready",
+                block.id(),
+                block.epoch(),
+                block.round(),
+                Instant::now(),
+            );
             let commit_callback =
                 block_data::create_commit_callback(self.observer_block_data.clone());
             self.pipeline_builder().build_for_observer(
@@ -374,6 +395,7 @@ impl ConsensusObserver {
         message_received_time: Instant,
         block_payload: BlockPayload,
         payload_received_at: std::time::SystemTime,
+        payload_ingress: Instant,
     ) {
         // Get the epoch and round for the block
         let block_epoch = block_payload.epoch();
@@ -438,6 +460,20 @@ impl ConsensusObserver {
         // Existing stale/duplicate checks and proof verification above select the first
         // accepted current-epoch payload. Use its ingress time, not verification time.
         if verified_payload {
+            crate::consensus_observer::common::timeline::record(
+                "payload_ingress",
+                block_payload.block().id(),
+                block_epoch,
+                block_round,
+                payload_ingress,
+            );
+            crate::consensus_observer::common::timeline::record(
+                "payload_verified",
+                block_payload.block().id(),
+                block_epoch,
+                block_round,
+                Instant::now(),
+            );
             metrics::observe_payload_arrival(
                 payload_received_at,
                 block_payload.block().timestamp_usecs(),
@@ -471,6 +507,7 @@ impl ConsensusObserver {
         peer_network_id: PeerNetworkId,
         message_received_time: Instant,
         commit_decision: CommitDecision,
+        commit_ingress: Instant,
     ) {
         // Get the commit decision epoch and round
         let commit_epoch = commit_decision.epoch();
@@ -508,6 +545,21 @@ impl ConsensusObserver {
                 return;
             }
 
+            let info = commit_decision.proof_block_info();
+            crate::consensus_observer::common::timeline::record(
+                "commit_ingress",
+                info.id(),
+                info.epoch(),
+                info.round(),
+                commit_ingress,
+            );
+            crate::consensus_observer::common::timeline::record(
+                "commit_verified",
+                info.id(),
+                info.epoch(),
+                info.round(),
+                Instant::now(),
+            );
             // Update the latency metrics for commit processing
             update_message_processing_latency_metrics(
                 message_received_time,
@@ -653,6 +705,7 @@ impl ConsensusObserver {
                     peer_network_id,
                     message_received_time,
                     commit_decision,
+                    ingress_instant,
                 );
             },
             ConsensusObserverDirectSend::BlockPayload(block_payload) => {
@@ -661,6 +714,7 @@ impl ConsensusObserver {
                     message_received_time,
                     block_payload,
                     ingress_wall_time,
+                    ingress_instant,
                 )
                 .await;
             },

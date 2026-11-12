@@ -186,6 +186,46 @@ impl ConsensusObserverNetworkHandler {
         // Create the consensus observer message
         let network_message = ConsensusObserverNetworkMessage::new(peer_network_id, message);
 
+        let at = network_message.received_at().0;
+        let record = |stage, block: &aptos_types::block_info::BlockInfo| {
+            crate::consensus_observer::common::timeline::record(
+                stage,
+                block.id(),
+                block.epoch(),
+                block.round(),
+                at,
+            );
+        };
+        match &network_message.message {
+            ConsensusObserverDirectSend::BlockPayload(payload) => {
+                record("raw_payload_ingress", payload.block())
+            },
+            ConsensusObserverDirectSend::CommitDecision(decision) => {
+                record("raw_commit_ingress", decision.proof_block_info())
+            },
+            message => {
+                let blocks: &[std::sync::Arc<
+                    aptos_consensus_types::pipelined_block::PipelinedBlock,
+                >] = match message {
+                    ConsensusObserverDirectSend::OrderedBlock(ordered) => ordered.blocks(),
+                    ConsensusObserverDirectSend::OrderedBlockWithWindow(window) => {
+                        window.ordered_block().blocks()
+                    },
+                    ConsensusObserverDirectSend::OrderedBlockV2(ordered) => ordered.blocks(),
+                    _ => unreachable!(),
+                };
+                for block in blocks {
+                    crate::consensus_observer::common::timeline::record(
+                        "order_ingress",
+                        block.id(),
+                        block.epoch(),
+                        block.round(),
+                        at,
+                    );
+                }
+            },
+        }
+
         // Send the message to the consensus observer
         if let Err(error) = self.observer_message_sender.push((), network_message) {
             error!(
