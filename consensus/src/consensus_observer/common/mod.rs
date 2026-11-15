@@ -4,3 +4,5 @@
 pub mod error;
 pub mod logging;
 pub mod metrics;
+
+pub(crate) mod timeline;

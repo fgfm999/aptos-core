@@ -404,6 +404,10 @@ pub struct OrderedBlockV2 {
 }
 
 impl OrderedBlockV2 {
+    pub fn blocks(&self) -> &[Arc<PipelinedBlock>] {
+        &self.blocks
+    }
+
     pub fn new(blocks: Vec<Arc<PipelinedBlock>>, ordered_proof: LedgerInfoWithSignatures) -> Self {
         Self {
             blocks,

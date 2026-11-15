@@ -46,7 +46,7 @@ use aptos_types::{
 use aptos_vm::VMBlockExecutor;
 use block_tree::BlockTree;
 use fail::fail_point;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub mod block_tree;
 
@@ -210,6 +210,12 @@ where
             transactions,
             auxiliary_info,
         } = block;
+        // Use the observer's stable 1/128 sample without depending on consensus.
+        let timing_start = (block_id.as_ref()[0] & 127 == 0
+            && aptos_logger::enabled!(aptos_logger::Level::Info))
+        .then(Instant::now);
+        let mut state_view_us = None;
+        let mut execution_output_us = None;
         let mut block_vec = self
             .block_tree
             .get_blocks_opt(&[block_id, parent_block_id])?;
@@ -240,53 +246,60 @@ where
             }
         }
 
-        let execution_output =
-            if parent_block_id != committed_block_id && parent_output.has_reconfiguration() {
-                // ignore reconfiguration suffix, even if the block is non-empty
-                info!(
-                    LogSchema::new(LogEntry::BlockExecutor).block_id(block_id),
-                    "reconfig_descendant_block_received"
-                );
-                parent_output.execution_output.reconfig_suffix()
-            } else {
-                let state_view = {
-                    let _timer = OTHER_TIMERS.timer_with(&["get_state_view"]);
-                    CachedStateView::new(
-                        StateViewId::BlockExecution { block_id },
-                        Arc::clone(&self.db.reader),
-                        parent_output.result_state().latest().clone(),
-                    )?
-                };
-
-                let _timer = GET_BLOCK_EXECUTION_OUTPUT_BY_EXECUTING.start_timer();
-                fail_point!("executor::block_executor_execute_block", |_| {
-                    Err(ExecutorError::from(anyhow::anyhow!(
-                        "Injected error in block_executor_execute_block"
-                    )))
-                });
-
-                DoGetExecutionOutput::by_transaction_execution(
-                    &self.block_executor,
-                    transactions,
-                    auxiliary_info,
-                    parent_output.result_state(),
-                    parent_output
-                        .result_positions()
-                        .zip(position_floor.as_ref())
-                        .map(|(overlay, floor)| PositionParent { overlay, floor }),
-                    parent_output
-                        .result_orders()
-                        .zip(order_floor.as_ref())
-                        .map(|(overlay, floor)| OrderParent { overlay, floor }),
-                    parent_output
-                        .result_collateral()
-                        .zip(collateral_floor.as_ref())
-                        .map(|(overlay, floor)| CollateralParent { overlay, floor }),
-                    state_view,
-                    onchain_config,
-                    TransactionSliceMetadata::block(parent_block_id, block_id),
+        let execution_output = if parent_block_id != committed_block_id
+            && parent_output.has_reconfiguration()
+        {
+            // ignore reconfiguration suffix, even if the block is non-empty
+            info!(
+                LogSchema::new(LogEntry::BlockExecutor).block_id(block_id),
+                "reconfig_descendant_block_received"
+            );
+            parent_output.execution_output.reconfig_suffix()
+        } else {
+            let state_view_start = timing_start.map(|_| Instant::now());
+            let state_view = {
+                let _timer = OTHER_TIMERS.timer_with(&["get_state_view"]);
+                CachedStateView::new(
+                    StateViewId::BlockExecution { block_id },
+                    Arc::clone(&self.db.reader),
+                    parent_output.result_state().latest().clone(),
                 )?
             };
+
+            state_view_us = state_view_start.map(|at| at.elapsed().as_micros() as u64);
+            let execution_output_start = timing_start.map(|_| Instant::now());
+            let _timer = GET_BLOCK_EXECUTION_OUTPUT_BY_EXECUTING.start_timer();
+            fail_point!("executor::block_executor_execute_block", |_| {
+                Err(ExecutorError::from(anyhow::anyhow!(
+                    "Injected error in block_executor_execute_block"
+                )))
+            });
+
+            let output = DoGetExecutionOutput::by_transaction_execution(
+                &self.block_executor,
+                transactions,
+                auxiliary_info,
+                parent_output.result_state(),
+                parent_output
+                    .result_positions()
+                    .zip(position_floor.as_ref())
+                    .map(|(overlay, floor)| PositionParent { overlay, floor }),
+                parent_output
+                    .result_orders()
+                    .zip(order_floor.as_ref())
+                    .map(|(overlay, floor)| OrderParent { overlay, floor }),
+                parent_output
+                    .result_collateral()
+                    .zip(collateral_floor.as_ref())
+                    .map(|(overlay, floor)| CollateralParent { overlay, floor }),
+                state_view,
+                onchain_config,
+                TransactionSliceMetadata::block(parent_block_id, block_id),
+            )?;
+            execution_output_us = execution_output_start.map(|at| at.elapsed().as_micros() as u64);
+            output
+        };
+        let result_processing_start = timing_start.map(|_| Instant::now());
 
         // Record Executed(Keep/Retry/Discard) for traced txns in this block.
         {
@@ -312,6 +325,17 @@ where
         let _ = self
             .block_tree
             .add_block(parent_block_id, block_id, output)?;
+        if let Some(start) = timing_start {
+            info!(
+                block_id = block_id.to_hex(),
+                state_view_us = state_view_us,
+                execution_output_us = execution_output_us,
+                result_processing_us =
+                    result_processing_start.map(|at| at.elapsed().as_micros() as u64),
+                total_us = start.elapsed().as_micros() as u64,
+                "OBSERVER_EXECUTOR_TIMING"
+            );
+        }
         Ok(())
     }
 
