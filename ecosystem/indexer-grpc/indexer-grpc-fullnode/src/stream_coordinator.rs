@@ -4,6 +4,7 @@
 use crate::{
     convert::convert_transaction,
     counters::UNABLE_TO_FETCH_TRANSACTION,
+    raw_filter::{Decision, RawFilter},
     runtime::{DEFAULT_NUM_RETRIES, RETRY_TIME_MILLIS},
 };
 use aptos_api::context::Context;
@@ -193,26 +194,27 @@ impl IndexerStreamCoordinator {
         let output_batch_size = self.output_batch_size;
         let ledger_chain_id = self.context.chain_id().id();
         let filter = self.filter.clone();
+        let raw_filter = self.filter.as_ref().map(RawFilter::new).map(Arc::new);
         let mut tasks = vec![];
         for batch in task_batches {
             let context = self.context.clone();
             let filter = filter.clone();
+            let raw_filter = raw_filter.clone();
             let task = tokio::task::spawn_blocking(move || {
                 // Capture the original scan bounds before filtering removes transactions.
                 let start_version = batch.first().unwrap().version;
                 let end_version = batch.last().unwrap().version;
                 let raw_txns = batch;
-                let api_txns = Self::convert_to_api_txns(context, raw_txns);
+                let api_txns = Self::convert_to_api_txns(context, raw_txns, raw_filter.as_deref());
                 let pb_txns = Self::convert_to_pb_txns(api_txns);
-                // Apply filter if present.
-                let pb_txns = if let Some(ref filter) = filter {
-                    pb_txns
-                        .into_iter()
-                        .filter(|txn| filter.matches(txn))
-                        .collect::<Vec<_>>()
-                } else {
-                    pb_txns
-                };
+                let pb_txns = pb_txns
+                    .into_iter()
+                    .filter_map(|(txn, decision)| {
+                        decision
+                            .resolve(|| filter.as_ref().is_none_or(|filter| filter.matches(&txn)))
+                            .then_some(txn)
+                    })
+                    .collect();
                 responses_with_ranges(
                     pb_txns,
                     start_version,
@@ -416,13 +418,15 @@ impl IndexerStreamCoordinator {
     fn convert_to_api_txns(
         context: Arc<Context>,
         raw_txns: Vec<TransactionOnChainData>,
-    ) -> Vec<(APITransaction, TransactionSizeInfo)> {
+        raw_filter: Option<&RawFilter>,
+    ) -> Vec<(APITransaction, TransactionSizeInfo, Decision)> {
         if raw_txns.is_empty() {
             return vec![];
         }
         let start_millis = chrono::Utc::now().naive_utc();
 
         let first_version = raw_txns.first().map(|txn| txn.version).unwrap();
+        let last_version = raw_txns.last().map(|txn| txn.version).unwrap();
         let state_view = context.latest_state_view().unwrap();
         let converter = state_view.as_converter(context.db.clone(), context.indexer_reader.clone());
 
@@ -461,6 +465,11 @@ impl IndexerStreamCoordinator {
                     block_height += 1;
                     block_height_bcs = aptos_api_types::U64::from(block_height);
                 }
+            }
+            // Metadata above must advance even when this transaction is filtered out.
+            let decision = raw_filter.map_or(Decision::Match, |filter| filter.evaluate(&raw_txn));
+            if decision == Decision::NoMatch {
+                continue;
             }
             let size_info = Self::get_size_info(&raw_txn);
             let res = converter
@@ -501,7 +510,7 @@ impl IndexerStreamCoordinator {
                     txn
                 });
             match res {
-                Ok(transaction) => transactions.push((transaction, size_info)),
+                Ok(transaction) => transactions.push((transaction, size_info, decision)),
                 Err(err) => {
                     UNABLE_TO_FETCH_TRANSACTION.inc();
                     error!(
@@ -519,18 +528,11 @@ impl IndexerStreamCoordinator {
             }
         }
 
-        if transactions.is_empty() {
-            panic!("[Indexer Fullnode] No transactions!");
-        }
-
         let fetch_millis = (chrono::Utc::now().naive_utc() - start_millis).num_milliseconds();
 
         info!(
             start_version = first_version,
-            end_version = transactions
-                .last()
-                .map(|(txn, _size_info)| txn.version().unwrap())
-                .unwrap_or(0),
+            end_version = last_version,
             num_of_transactions = transactions.len(),
             fetch_duration_in_ms = fetch_millis,
             service_type = SERVICE_TYPE,
@@ -567,18 +569,19 @@ impl IndexerStreamCoordinator {
     }
 
     fn convert_to_pb_txns(
-        api_txns: Vec<(APITransaction, TransactionSizeInfo)>,
-    ) -> Vec<TransactionPB> {
+        api_txns: Vec<(APITransaction, TransactionSizeInfo, Decision)>,
+    ) -> Vec<(TransactionPB, Decision)> {
         api_txns
             .into_iter()
-            .map(|(txn, size_info)| {
+            .map(|(txn, size_info, decision)| {
                 let info = txn.transaction_info().unwrap();
-                convert_transaction(
+                let converted = convert_transaction(
                     &txn,
                     info.block_height.unwrap().0,
                     info.epoch.unwrap().0,
                     size_info,
-                )
+                );
+                (converted, decision)
             })
             .collect()
     }
