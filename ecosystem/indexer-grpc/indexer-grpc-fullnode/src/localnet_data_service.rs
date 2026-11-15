@@ -58,7 +58,6 @@ impl RawData for LocalnetDataService {
         let output_batch_size = self.service_context.output_batch_size;
         let transaction_channel_size = self.service_context.transaction_channel_size;
         let ledger_chain_id = context.chain_id().id();
-        let transactions_count = r.transactions_count;
 
         // Parse transaction filter if present.
         let filter = if let Some(proto_filter) = r.transaction_filter {
@@ -109,30 +108,17 @@ impl RawData for LocalnetDataService {
             }
         });
         tokio::spawn(async move {
-            let mut response_transactions_count = transactions_count;
             while let Some(response) = rx.recv().await {
-                if let Some(count) = response_transactions_count.as_ref() {
-                    if *count == 0 {
-                        break;
-                    }
-                }
-
-                let response = response.map(|t| TransactionsResponse {
-                    chain_id: Some(ledger_chain_id as u64),
-                    transactions: match t.response.expect("Response must be set") {
-                        transactions_from_node_response::Response::Data(transaction_output) => {
-                            let mut transactions = transaction_output.transactions;
-                            let current_transactions_count = transactions.len() as u64;
-                            if let Some(count) = response_transactions_count.as_mut() {
-                                transactions =
-                                    transactions.into_iter().take(*count as usize).collect();
-                                *count = count.saturating_sub(current_transactions_count);
-                            }
-                            transactions
+                let response = response.map(|item| TransactionsResponse {
+                    chain_id: Some(item.response.chain_id as u64),
+                    transactions: match item.response.response.expect("Response must be set") {
+                        transactions_from_node_response::Response::Data(output) => {
+                            output.transactions
                         },
                         _ => panic!("Unexpected response type."),
                     },
-                    processed_range: None,
+                    // Progress covers scanned versions, including transactions rejected by the filter.
+                    processed_range: item.processed_range,
                 });
                 match external_service_tx.send(response).await {
                     Ok(_) => {},

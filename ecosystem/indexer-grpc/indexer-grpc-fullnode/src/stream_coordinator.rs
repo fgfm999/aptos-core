@@ -15,6 +15,7 @@ use aptos_indexer_grpc_utils::{
 };
 use aptos_logger::{error, info, sample, sample::SampleRate, warn};
 use aptos_protos::{
+    indexer::v1::ProcessedRange,
     internal::fullnode::v1::{
         transactions_from_node_response, TransactionsFromNodeResponse, TransactionsOutput,
     },
@@ -38,6 +39,22 @@ use tonic::Status;
 
 type EndVersion = u64;
 
+/// Internal envelope: preserve scan progress separately from filtered transactions.
+#[derive(Debug)]
+pub struct StreamResponse {
+    pub response: TransactionsFromNodeResponse,
+    pub processed_range: Option<ProcessedRange>,
+}
+
+impl From<TransactionsFromNodeResponse> for StreamResponse {
+    fn from(response: TransactionsFromNodeResponse) -> Self {
+        Self {
+            response,
+            processed_range: None,
+        }
+    }
+}
+
 /// Checks if an error message indicates that the requested version has been pruned.
 fn is_pruned_error(err: &anyhow::Error) -> bool {
     let err_str = err.to_string();
@@ -56,7 +73,7 @@ pub struct IndexerStreamCoordinator {
     pub output_batch_size: u16,
     pub highest_known_version: u64,
     pub context: Arc<Context>,
-    pub transactions_sender: mpsc::Sender<Result<TransactionsFromNodeResponse, tonic::Status>>,
+    pub transactions_sender: mpsc::Sender<Result<StreamResponse, tonic::Status>>,
     pub filter: Option<BooleanTransactionFilter>,
     abort_handle: Option<Arc<AtomicBool>>,
 }
@@ -78,7 +95,7 @@ impl IndexerStreamCoordinator {
         processor_task_count: u16,
         processor_batch_size: u16,
         output_batch_size: u16,
-        transactions_sender: mpsc::Sender<Result<TransactionsFromNodeResponse, tonic::Status>>,
+        transactions_sender: mpsc::Sender<Result<StreamResponse, tonic::Status>>,
         filter: Option<BooleanTransactionFilter>,
         abort_handle: Option<Arc<AtomicBool>>,
     ) -> Self {
@@ -181,6 +198,9 @@ impl IndexerStreamCoordinator {
             let context = self.context.clone();
             let filter = filter.clone();
             let task = tokio::task::spawn_blocking(move || {
+                // Capture the original scan bounds before filtering removes transactions.
+                let start_version = batch.first().unwrap().version;
+                let end_version = batch.last().unwrap().version;
                 let raw_txns = batch;
                 let api_txns = Self::convert_to_api_txns(context, raw_txns);
                 let pb_txns = Self::convert_to_pb_txns(api_txns);
@@ -193,22 +213,14 @@ impl IndexerStreamCoordinator {
                 } else {
                     pb_txns
                 };
-                let mut responses = vec![];
-                // Wrap in stream response object and send to channel
-                for chunk in pb_txns.chunks(output_batch_size as usize) {
-                    for chunk in chunk_transactions(chunk.to_vec(), MESSAGE_SIZE_LIMIT) {
-                        let item = TransactionsFromNodeResponse {
-                            response: Some(transactions_from_node_response::Response::Data(
-                                TransactionsOutput {
-                                    transactions: chunk,
-                                },
-                            )),
-                            chain_id: ledger_chain_id as u32,
-                        };
-                        responses.push(item);
-                    }
-                }
-                responses
+                responses_with_ranges(
+                    pb_txns,
+                    start_version,
+                    end_version,
+                    output_batch_size as usize,
+                    ledger_chain_id as u32,
+                    MESSAGE_SIZE_LIMIT,
+                )
             });
             tasks.push(task);
         }
@@ -618,5 +630,138 @@ impl IndexerStreamCoordinator {
             }
         }
         true
+    }
+}
+
+fn responses_with_ranges(
+    transactions: Vec<TransactionPB>,
+    first_version: u64,
+    last_version: u64,
+    output_batch_size: usize,
+    chain_id: u32,
+    message_size_limit: usize,
+) -> Vec<StreamResponse> {
+    let mut next_version = first_version;
+    let mut responses = vec![];
+    for chunk in transactions.chunks(output_batch_size) {
+        for chunk in chunk_transactions(chunk.to_vec(), message_size_limit) {
+            let end = chunk.last().unwrap().version;
+            responses.push(StreamResponse {
+                response: TransactionsFromNodeResponse {
+                    chain_id,
+                    response: Some(transactions_from_node_response::Response::Data(
+                        TransactionsOutput {
+                            transactions: chunk,
+                        },
+                    )),
+                },
+                processed_range: Some(ProcessedRange {
+                    first_version: next_version,
+                    last_version: end,
+                }),
+            });
+            next_version = end + 1;
+        }
+    }
+    if let Some(last) = responses.last_mut() {
+        last.processed_range.as_mut().unwrap().last_version = last_version;
+    } else {
+        responses.push(StreamResponse {
+            response: TransactionsFromNodeResponse {
+                chain_id,
+                response: Some(transactions_from_node_response::Response::Data(
+                    TransactionsOutput {
+                        transactions: vec![],
+                    },
+                )),
+            },
+            processed_range: Some(ProcessedRange {
+                first_version,
+                last_version,
+            }),
+        });
+    }
+    responses
+}
+
+#[cfg(test)]
+mod processed_range_tests {
+    use super::*;
+
+    fn transactions(versions: &[u64]) -> Vec<TransactionPB> {
+        versions
+            .iter()
+            .map(|v| TransactionPB {
+                version: *v,
+                ..Default::default()
+            })
+            .collect()
+    }
+    fn ranges(responses: &[StreamResponse]) -> Vec<(u64, u64)> {
+        responses
+            .iter()
+            .map(|r| {
+                let r = r.processed_range.as_ref().unwrap();
+                (r.first_version, r.last_version)
+            })
+            .collect()
+    }
+    #[test]
+    fn filtered_final_chunk_includes_scanned_tail() {
+        let responses = responses_with_ranges(
+            transactions(&[102, 105, 108]),
+            100,
+            110,
+            2,
+            1,
+            MESSAGE_SIZE_LIMIT,
+        );
+        assert_eq!(ranges(&responses), vec![(100, 105), (106, 110)]);
+        let data: Vec<_> = responses
+            .into_iter()
+            .flat_map(|r| match r.response.response.unwrap() {
+                transactions_from_node_response::Response::Data(d) => d
+                    .transactions
+                    .into_iter()
+                    .map(|t| t.version)
+                    .collect::<Vec<_>>(),
+                _ => panic!("expected data"),
+            })
+            .collect();
+        assert_eq!(data, vec![102, 105, 108]);
+    }
+    #[test]
+    fn all_filtered_still_returns_original_range() {
+        let responses = responses_with_ranges(vec![], 100, 110, 2, 1, MESSAGE_SIZE_LIMIT);
+        assert_eq!(ranges(&responses), vec![(100, 110)]);
+        match responses[0].response.response.as_ref().unwrap() {
+            transactions_from_node_response::Response::Data(d) => {
+                assert!(d.transactions.is_empty())
+            },
+            _ => panic!("expected data"),
+        }
+    }
+    #[test]
+    fn byte_splitting_preserves_original_scanned_range() {
+        let responses = responses_with_ranges(transactions(&[102, 105, 108]), 100, 110, 100, 1, 3);
+        assert!(responses.len() > 1);
+        let ranges = ranges(&responses);
+        assert_eq!(ranges.first().unwrap().0, 100);
+        assert_eq!(ranges.last().unwrap().1, 110);
+        assert!(ranges.windows(2).all(|w| w[0].1 + 1 == w[1].0));
+    }
+    #[test]
+    fn adjacent_tasks_publish_independent_ranges() {
+        let mut responses =
+            responses_with_ranges(transactions(&[102]), 100, 105, 2, 1, MESSAGE_SIZE_LIMIT);
+        responses.extend(responses_with_ranges(
+            vec![],
+            106,
+            110,
+            2,
+            1,
+            MESSAGE_SIZE_LIMIT,
+        ));
+        assert_eq!(ranges(&responses), vec![(100, 105), (106, 110)]);
     }
 }

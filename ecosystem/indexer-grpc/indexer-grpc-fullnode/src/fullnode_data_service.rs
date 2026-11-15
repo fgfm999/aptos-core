@@ -117,7 +117,7 @@ impl FullnodeData for FullnodeDataService {
             );
             // Sends init message (one time per request) to the client in the with chain id and starting version. Basically a handshake
             let init_status = get_status(StatusType::Init, starting_version, None, ledger_chain_id);
-            match tx.send(Result::<_, Status>::Ok(init_status)).await {
+            match tx.send(Result::<_, Status>::Ok(init_status.into())).await {
                 Ok(_) => {
                     // TODO: Add request details later
                     info!(
@@ -170,7 +170,10 @@ impl FullnodeData for FullnodeDataService {
                 CHANNEL_SIZE
                     .with_label_values(&["2"])
                     .set(channel_size as i64);
-                match tx.send(Result::<_, Status>::Ok(batch_end_status)).await {
+                match tx
+                    .send(Result::<_, Status>::Ok(batch_end_status.into()))
+                    .await
+                {
                     Ok(_) => {
                         // tps logging
                         let new_base: u64 = ma.sum() / (DEFAULT_EMIT_SIZE as u64);
@@ -198,7 +201,9 @@ impl FullnodeData for FullnodeDataService {
                 coordinator.current_version = max_version + 1;
             }
         });
-        let output_stream = ReceiverStream::new(rx);
+        let output_stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), |result| {
+            result.map(|item| item.response)
+        });
         Ok(Response::new(
             Box::pin(output_stream) as Self::GetTransactionsFromNodeStream
         ))
