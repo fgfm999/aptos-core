@@ -646,8 +646,8 @@ fn responses_with_ranges(
 ) -> Vec<StreamResponse> {
     let mut next_version = first_version;
     let mut responses = vec![];
-    for chunk in transactions.chunks(output_batch_size) {
-        for chunk in chunk_transactions(chunk.to_vec(), message_size_limit) {
+    for chunk in &transactions.into_iter().chunks(output_batch_size) {
+        for chunk in chunk_transactions(chunk.collect(), message_size_limit) {
             let end = chunk.last().unwrap().version;
             responses.push(StreamResponse {
                 response: TransactionsFromNodeResponse {
