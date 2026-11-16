@@ -791,7 +791,13 @@ impl PipelineBuilder {
             block.round(),
             Instant::now(),
         );
-        let input_txns = [decrypted_txns, regular_txns].concat();
+        let input_txns = if decrypted_txns.is_empty() {
+            regular_txns
+        } else {
+            let mut txns = decrypted_txns;
+            txns.extend(regular_txns);
+            txns
+        };
 
         tracker.start_working();
 
