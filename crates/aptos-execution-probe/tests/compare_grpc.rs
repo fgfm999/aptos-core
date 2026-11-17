@@ -40,6 +40,11 @@ impl ExecutionProbe for MockProbe {
             include_data: true,
             data_format: i32::from(bcs),
             bcs_schema_version: u32::from(bcs),
+            transaction_filter_json: if bcs {
+                r#"{"type":"sender","address":"0x1"}"#.into()
+            } else {
+                String::new()
+            },
             session_id: "fixture".into(),
             chain_id: 4,
             ..Default::default()
@@ -208,6 +213,15 @@ async fn compare_mode(bcs: bool, timestamp: Option<aptos_protos::util::timestamp
         serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
     assert_eq!(report["samples"], 1);
     assert_eq!(report["include_data"], true);
+    assert_eq!(
+        report["indexer_only_may_include_filtered_transactions"],
+        bcs
+    );
+    if bcs {
+        assert_eq!(report["probe_transaction_filter"]["type"], "sender");
+    } else {
+        assert!(report["probe_transaction_filter"].is_null());
+    }
     assert_eq!(report["data_format"], if bcs { "bcs" } else { "json" });
     assert_eq!(report["bcs_bytes_received"], if bcs { 5 } else { 0 });
     assert_eq!(report["data_transactions"], 1);

@@ -272,3 +272,107 @@ The comparison client does not decode BCS bodies: its timing still ends when the
 gRPC response is received and decoded, before the bot parses or applies data.
 Measure bot decode/application separately before claiming usable-data latency.
 No latency improvement is inferred from passing functional tests.
+
+## Filter before serialization
+
+`execution_probe.transaction_filter` selects whole successful user transactions
+before hashing and BCS/JSON conversion. It is a node startup setting shared by all
+subscribers. Omit it to preserve the unfiltered feed. Rebuild and restart the node
+to change selection.
+
+To keep successful user transactions whose outer entry is not at the Decibel
+address:
+
+```yaml
+execution_probe:
+  enabled: true
+  include_data: true
+  data_format: bcs
+  address: "127.0.0.1:50052"
+  transaction_filter:
+    type: not
+    filter:
+      type: entry_function
+      address: "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06"
+```
+
+Successful user status is always required, so there is no extra success/type
+predicate. This selection does not skip execution, signature checks, or storage
+of any transaction.
+
+To select the exact order entry with an OrderEvent instead:
+
+```yaml
+  transaction_filter:
+    type: and
+    filters:
+      - type: entry_function
+        address: "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06"
+        module: dex_accounts_entry
+        function: place_order_to_subaccount
+      - type: event
+        type_tag: "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types::OrderEvent"
+```
+
+The second snippet replaces the `transaction_filter` key inside the same
+`execution_probe` section.
+
+| type | Fields | Meaning |
+| --- | --- | --- |
+| sender | address | Exact signer sender address |
+| entry_function | address, module, function | Every supplied field must match the outer executable entry |
+| event | address, module, name, type_tag | At least one event must satisfy every supplied field |
+| and | filters | All children match; short-circuits |
+| or | filters | Any child matches; short-circuits |
+| not | filter | Negates its child |
+
+Entry and event fields are optional, but each leaf needs at least one constraint.
+Addresses are parsed once and compared as native addresses, so supported short
+and padded forms are equivalent. Names are case sensitive. A full event
+`type_tag` includes exact generic arguments, for example
+`0x1::example::E<u64>`. Address/module/name constraints without `type_tag` leave
+generic arguments unrestricted. A sender leaf can be combined with either
+example by adding it to an `and.filters` list.
+
+An entry predicate returns false for scripts or an unavailable executable entry;
+`not` negates that false result. Embedded multisig entries, V1 payloads and already
+decrypted executables use the native `executable_ref()` accessor when available.
+The filter does not execute or decrypt anything. Matching the outer entry does not
+identify all internal calls. An OrderEvent may be produced by another outer entry;
+use the event predicate when that is the intended criterion. An AND of two event
+leaves can match two different events; fields inside a single event leaf must
+match the same event.
+
+Filtering borrows `SignedTransaction` and `TransactionOutput`. It creates no PB
+projection, performs no state lookup and does not decode event or resource bodies.
+Event JSON substrings, field values such as order price, and resource predicates
+are outside this filter schema. Unknown fields, invalid addresses/names/type tags,
+empty leaves and empty AND/OR lists reject startup. Ready filter metadata is
+limited to 16 KiB.
+
+A match still carries the full original transaction/output for the selected data
+format, including unrelated events and writes. The filter does not prune an
+output's contents. Original transaction indices are retained. A fully rejected
+block emits one empty final chunk with its sequence, so rejection does not become
+a stream gap. It also skips JSON state-view creation for that block. Rejected
+transactions do not consume the response-size budget.
+
+Ready reports `transaction_filter_json` (empty when no extra filter is configured).
+It is Ready-only metadata; later data frames leave it empty. The updated comparator
+records it as `probe_transaction_filter` in summary. Its Indexer request remains
+unfiltered, so `indexer_only_may_include_filtered_transactions=true` means
+Indexer-only records can be deliberate probe exclusions, as well as window
+boundaries or other unmatched observations. Arrival/age distributions contain the
+matched selected cohort, which may differ substantially from an unfiltered run.
+Rebuild the comparator alongside the node to retain this explanation in reports.
+
+Additional metrics:
+
+- `execution_probe_duration_seconds{stage="filter"}`: eligible-transaction selection,
+  including hashes for matches, measured once per block when a filter is present.
+- `execution_probe_events_total{kind="filter_examined_transactions"}`: successful
+  user transactions evaluated by the configured filter.
+- `execution_probe_events_total{kind="filtered_transactions"}`: those rejected.
+
+Filtered transactions are not counted as dropped blocks. Existing queue,
+subscriber, and oversized accepted-transaction behavior remains in effect.

@@ -46,6 +46,8 @@ message ProbeEvent {
   repeated ExecutedTransactionData transaction_data = 13;
   DataFormat data_format = 14;
   uint32 bcs_schema_version = 15;
+  // Ready-only startup filter in config JSON. Empty means no extra filter.
+  string transaction_filter_json = 16;
 }
 service ExecutionProbe {
   rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);

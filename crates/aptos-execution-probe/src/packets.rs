@@ -27,10 +27,20 @@ pub(crate) fn build(
     hub: &Hub,
     context: Option<&DataContext>,
 ) -> Result<Vec<ProbeEvent>> {
-    let ids = successful_ids(&o.output.to_commit);
+    let filter_started = Instant::now();
+    let ids = successful_ids(&o.output.to_commit, hub.filter.as_ref());
+    if hub.filter.is_some() {
+        DURATIONS
+            .with_label_values(&["filter"])
+            .observe(filter_started.elapsed().as_secs_f64());
+    }
     let data = context.map(|context| {
         let at = Instant::now();
-        let data = context.convert(&o.output, &ids);
+        let data = if ids.is_empty() {
+            Vec::new()
+        } else {
+            context.convert(&o.output, &ids)
+        };
         DURATIONS
             .with_label_values(&["data_conversion"])
             .observe(at.elapsed().as_secs_f64());
@@ -58,6 +68,7 @@ pub(crate) fn build(
             include_data: context.is_some(),
             data_format: hub.data_format as i32,
             bcs_schema_version: hub.bcs_schema_version,
+            transaction_filter_json: String::new(),
             dropped_blocks: hub.dropped.load(Ordering::Relaxed),
         };
         if event.encoded_len() > MAX_BYTES {

@@ -177,6 +177,7 @@ pub fn start_consensus_observer(
                             format: node_config.execution_probe.data_format,
                         }
                     }),
+                    node_config.execution_probe.transaction_filter.clone(),
                 )
                 .expect("execution probe startup failed"),
             )

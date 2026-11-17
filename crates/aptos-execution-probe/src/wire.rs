@@ -75,5 +75,8 @@ pub struct ProbeEvent {
     pub data_format: i32,
     #[prost(uint32, tag = "15")]
     pub bcs_schema_version: u32,
+    /// Ready-only startup filter, serialized as config JSON; empty means no filter.
+    #[prost(string, tag = "16")]
+    pub transaction_filter_json: String,
 }
 include!("service.rs");

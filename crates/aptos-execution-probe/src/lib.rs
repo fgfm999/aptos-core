@@ -3,6 +3,7 @@
 
 pub mod compare;
 pub mod decibel;
+mod filter;
 mod packets;
 pub mod payload;
 pub mod wire;
@@ -69,6 +70,8 @@ struct Hub {
     include_data: bool,
     data_format: wire::DataFormat,
     bcs_schema_version: u32,
+    filter: Option<filter::RawFilter>,
+    filter_json: String,
 }
 #[derive(Clone)]
 pub struct Publisher {
@@ -111,30 +114,45 @@ impl Publisher {
 }
 
 pub fn start(address: SocketAddr, chain_id: u32) -> Result<Publisher> {
-    start_configured(address, chain_id, None)
+    start_configured(address, chain_id, None, None)
 }
 
 pub fn start_configured(
     address: SocketAddr,
     chain_id: u32,
     context: Option<payload::DataContext>,
+    transaction_filter: Option<aptos_config::config::ExecutionProbeFilter>,
 ) -> Result<Publisher> {
     let listener = std::net::TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     aptos_logger::info!("Execution probe listening on {}", listener.local_addr()?);
-    start_listener_with_data(listener, chain_id, context)
+    start_listener_with_data(listener, chain_id, context, transaction_filter)
 }
 
 #[cfg(test)]
 fn start_listener(listener: std::net::TcpListener, chain_id: u32) -> Result<Publisher> {
-    start_listener_with_data(listener, chain_id, None)
+    start_listener_with_data(listener, chain_id, None, None)
 }
 
 fn start_listener_with_data(
     listener: std::net::TcpListener,
     chain_id: u32,
     context: Option<payload::DataContext>,
+    transaction_filter: Option<aptos_config::config::ExecutionProbeFilter>,
 ) -> Result<Publisher> {
+    let filter = transaction_filter
+        .as_ref()
+        .map(filter::RawFilter::compile)
+        .transpose()?;
+    let filter_json = transaction_filter
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        filter_json.len() <= 16 * 1024,
+        "probe filter metadata exceeds 16 KiB"
+    );
     let (events, _) = broadcast::channel(256);
     let hub = Arc::new(Hub {
         session: uuid::Uuid::new_v4().to_string(),
@@ -142,6 +160,8 @@ fn start_listener_with_data(
         events,
         dropped: AtomicU64::new(0),
         include_data: context.is_some(),
+        filter,
+        filter_json,
         data_format: context
             .as_ref()
             .map_or(wire::DataFormat::Json, |c| c.wire_format()),
@@ -202,16 +222,26 @@ fn start_listener_with_data(
 
 fn successful_ids(
     output: &aptos_executor_types::transactions_with_output::TransactionsWithOutput,
+    filter: Option<&filter::RawFilter>,
 ) -> Vec<TransactionId> {
-    output
+    let mut examined = 0;
+    let mut rejected = 0;
+    let ids = output
         .transactions
         .iter()
         .zip(&output.transaction_outputs)
         .enumerate()
         .filter_map(|(index, (txn, result))| {
-            if matches!(txn, Transaction::UserTransaction(_))
+            if let Transaction::UserTransaction(user) = txn
                 && matches!(result.status(), TransactionStatus::Keep(status) if status.is_success())
             {
+                if let Some(filter) = filter {
+                    examined += 1;
+                    if !filter.matches(user, result) {
+                        rejected += 1;
+                        return None;
+                    }
+                }
                 Some(TransactionId {
                     hash: txn.committed_hash().to_vec(),
                     transaction_index: index as u32,
@@ -220,7 +250,16 @@ fn successful_ids(
                 None
             }
         })
-        .collect()
+        .collect();
+    if filter.is_some() {
+        COUNTERS
+            .with_label_values(&["filter_examined_transactions"])
+            .inc_by(examined);
+        COUNTERS
+            .with_label_values(&["filtered_transactions"])
+            .inc_by(rejected);
+    }
+    ids
 }
 
 struct Service(Arc<Hub>);
@@ -244,6 +283,7 @@ impl ExecutionProbe for Service {
                 include_data: hub.include_data,
                 data_format: hub.data_format as i32,
                 bcs_schema_version: hub.bcs_schema_version,
+                transaction_filter_json: hub.filter_json.clone(),
                 ..Default::default()
             }))
             .await
@@ -291,11 +331,14 @@ mod tests {
     use tokio_stream::StreamExt;
 
     fn user() -> Transaction {
+        user_at(AccountAddress::ONE, vec![])
+    }
+    fn user_at(sender: AccountAddress, code: Vec<u8>) -> Transaction {
         let key = Ed25519PrivateKey::try_from(&[7u8; 32][..]).unwrap();
         let raw = RawTransaction::new(
-            AccountAddress::ONE,
+            sender,
             1,
-            TransactionPayload::Script(Script::new(vec![], vec![], vec![])),
+            TransactionPayload::Script(Script::new(code, vec![], vec![])),
             1000,
             1,
             1000,
@@ -340,7 +383,7 @@ mod tests {
             ],
             persisted_auxiliary_infos: vec![],
         };
-        let ids = successful_ids(&output);
+        let ids = successful_ids(&output, None);
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].hash, tx.committed_hash().to_vec());
         assert_eq!(ids[0].transaction_index, 0);
@@ -356,6 +399,8 @@ mod tests {
             include_data: false,
             data_format: wire::DataFormat::Json,
             bcs_schema_version: 0,
+            filter: None,
+            filter_json: String::new(),
         });
         let _sub = hub.events.subscribe();
         let (sender, _receiver) = mpsc::channel(16);
@@ -384,6 +429,8 @@ mod tests {
             include_data: false,
             data_format: wire::DataFormat::Json,
             bcs_schema_version: 0,
+            filter: None,
+            filter_json: String::new(),
         });
         let mut stream = Service(hub.clone())
             .subscribe(Request::new(SubscribeRequest {}))
@@ -478,6 +525,7 @@ mod tests {
                 indexer_reader: None,
                 format,
             }),
+            None,
         )
         .unwrap();
         let mut client = wire::execution_probe_client::ExecutionProbeClient::connect(format!(
@@ -518,5 +566,220 @@ mod tests {
             "{}",
             event.transaction_data[0].conversion_error
         );
+    }
+    #[tokio::test]
+    async fn grpc_filter_skips_oversized_rejections_and_preserves_empty_block_progress() {
+        use aptos_config::config::{ExecutionProbeDataFormat, ExecutionProbeFilter};
+        struct NoReadDb;
+        impl aptos_storage_interface::DbReader for NoReadDb {}
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let filter = ExecutionProbeFilter::Sender {
+            address: "0x1".into(),
+        };
+        let publisher = start_listener_with_data(
+            listener,
+            4,
+            Some(payload::DataContext {
+                db: Arc::new(NoReadDb),
+                indexer_reader: None,
+                format: ExecutionProbeDataFormat::Bcs,
+            }),
+            Some(filter.clone()),
+        )
+        .unwrap();
+        let mut client =
+            wire::execution_probe_client::ExecutionProbeClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap();
+        let mut stream = client
+            .subscribe(SubscribeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let ready = stream.message().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<ExecutionProbeFilter>(&ready.transaction_filter_json).unwrap(),
+            filter
+        );
+        let kept = user();
+        let rejected = user_at(
+            AccountAddress::from_hex_literal("0x2").unwrap(),
+            vec![1; 3 * 1024 * 1024],
+        );
+        for (i, txns) in [
+            vec![
+                rejected.clone(),
+                kept.clone(),
+                rejected.clone(),
+                kept.clone(),
+            ],
+            vec![rejected],
+            vec![kept.clone()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            publisher.publish(
+                HashValue::zero(),
+                HashValue::zero(),
+                ExecutionOutput::new_dummy_with_input_txns(txns),
+            );
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.sequence, i as u64 + 1);
+            assert_eq!(frame.chunk_index, 0);
+            assert!(frame.last_chunk);
+            assert_eq!(frame.dropped_blocks, 0);
+            assert!(frame.transaction_filter_json.is_empty());
+            let indices = match i {
+                0 => vec![1, 3],
+                1 => vec![],
+                2 => vec![0],
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                frame
+                    .transactions
+                    .iter()
+                    .map(|t| t.transaction_index)
+                    .collect::<Vec<_>>(),
+                indices
+            );
+            assert_eq!(frame.transaction_data.len(), indices.len());
+            for (id, data) in frame.transactions.iter().zip(&frame.transaction_data) {
+                assert!(data.data_complete);
+                assert_eq!(data.hash, id.hash);
+                assert_eq!(data.transaction_index, id.transaction_index);
+                assert_eq!(id.hash, kept.committed_hash().to_vec());
+                let tx: Transaction = bcs::from_bytes(&data.transaction_bcs).unwrap();
+                assert_eq!(tx, kept);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_filter_keeps_original_indices() {
+        use aptos_config::config::ExecutionProbeFilter;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let publisher = start_listener_with_data(
+            listener,
+            4,
+            None,
+            Some(ExecutionProbeFilter::Sender {
+                address: "0x1".into(),
+            }),
+        )
+        .unwrap();
+        let mut client =
+            wire::execution_probe_client::ExecutionProbeClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap();
+        let mut stream = client
+            .subscribe(SubscribeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let ready = stream.message().await.unwrap().unwrap();
+        assert!(!ready.include_data && !ready.transaction_filter_json.is_empty());
+        publisher.publish(
+            HashValue::zero(),
+            HashValue::zero(),
+            ExecutionOutput::new_dummy_with_input_txns(vec![
+                user_at(AccountAddress::from_hex_literal("0x2").unwrap(), vec![]),
+                user(),
+            ]),
+        );
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.transactions.len(), 1);
+        assert_eq!(frame.transactions[0].transaction_index, 1);
+        assert!(frame.transaction_data.is_empty());
+    }
+    #[tokio::test]
+    async fn fully_filtered_json_block_never_reads_state() {
+        use aptos_config::config::{ExecutionProbeDataFormat, ExecutionProbeFilter};
+        struct NoReadDb;
+        impl aptos_storage_interface::DbReader for NoReadDb {}
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let publisher = start_listener_with_data(
+            listener,
+            4,
+            Some(payload::DataContext {
+                db: Arc::new(NoReadDb),
+                indexer_reader: None,
+                format: ExecutionProbeDataFormat::Json,
+            }),
+            Some(ExecutionProbeFilter::Sender {
+                address: "0x2".into(),
+            }),
+        )
+        .unwrap();
+        let mut client =
+            wire::execution_probe_client::ExecutionProbeClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap();
+        let mut stream = client
+            .subscribe(SubscribeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().unwrap().ready);
+        publisher.publish(
+            HashValue::zero(),
+            HashValue::zero(),
+            ExecutionOutput::new_dummy_with_input_txns(vec![user()]),
+        );
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            frame.last_chunk && frame.transactions.is_empty() && frame.transaction_data.is_empty()
+        );
+        assert_eq!(frame.dropped_blocks, 0);
+    }
+
+    #[test]
+    fn scripts_do_not_match_entry_filters_and_failure_is_never_selected() {
+        use aptos_config::config::ExecutionProbeFilter;
+        let config = ExecutionProbeFilter::Not {
+            filter: Box::new(ExecutionProbeFilter::EntryFunction {
+                address: Some(crate::decibel::DECIBEL.into()),
+                module: None,
+                function: None,
+            }),
+        };
+        let filter = filter::RawFilter::compile(&config).unwrap();
+        let txn = user();
+        let output = TransactionOutput::new_empty_success();
+        assert!(filter.matches(txn.try_as_signed_user_txn().unwrap(), &output));
+        let failed = TransactionOutput::new(
+            Default::default(),
+            vec![],
+            0,
+            TransactionStatus::Keep(ExecutionStatus::OutOfGas),
+            TransactionAuxiliaryData::None,
+        );
+        let txns = TransactionsWithOutput {
+            transactions: vec![txn.clone(), txn],
+            transaction_outputs: vec![failed, output],
+            persisted_auxiliary_infos: vec![],
+        };
+        let selected = successful_ids(&txns, Some(&filter));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].transaction_index, 1);
     }
 }

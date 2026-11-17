@@ -66,6 +66,15 @@ async fn main() -> Result<()> {
     {
         bail!("unsupported probe data format/schema");
     }
+    let probe_filter: Option<aptos_config::config::ExecutionProbeFilter> =
+        if ready.transaction_filter_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&ready.transaction_filter_json)
+                    .context("probe Ready transaction filter")?,
+            )
+        };
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -247,7 +256,7 @@ async fn main() -> Result<()> {
         age_samples < n || probe_ages.iter().chain(&indexer_ages).any(|&age| age < 0.0);
     let probe_age_stats = age_stats(&mut probe_ages);
     let indexer_age_stats = age_stats(&mut indexer_ages);
-    let summary = json!({"session_id":ready.session_id,"chain_id":ready.chain_id,"start_version":version+1,
+    let mut summary = json!({"session_id":ready.session_id,"chain_id":ready.chain_id,"start_version":version+1,
         "probe_endpoint":args.probe,"indexer_endpoint":args.indexer,"rest_build":head,
         "requested_seconds":args.seconds,"warmup_seconds":args.warmup_seconds,"elapsed_seconds":origin.elapsed().as_secs_f64(),
         "data_format":if ready.data_format == DataFormat::Bcs as i32 { "bcs" } else { "json" },"bcs_schema_version":ready.bcs_schema_version,"bcs_bytes_received":bcs_bytes_received,"include_data":ready.include_data,"data_transactions":data_transactions,"incomplete_data_transactions":incomplete_data_transactions,"events_received":events_received,"write_set_changes_received":changes_received,"data_incomplete":incomplete_data_transactions>0,
@@ -260,6 +269,8 @@ async fn main() -> Result<()> {
         "writer_error":writer_result.as_ref().err().map(ToString::to_string),"disconnect":disconnect,
         "insufficient_samples":n<10000,"measurement_impaired":incomplete_data_transactions>0 || dropped_blocks>0 || sequence_gaps>0 || matcher.counts.evicted>0 || writer_drops>0 || writer_result.is_err() || disconnect.is_some(),
         "metric":"Indexer receive minus probe receive on the same client monotonic clock; not execution_done absolute latency"});
+    summary["probe_transaction_filter"] = serde_json::to_value(&probe_filter)?;
+    summary["indexer_only_may_include_filtered_transactions"] = json!(probe_filter.is_some());
     tokio::fs::write(
         args.out.join("summary.json"),
         serde_json::to_vec_pretty(&summary)?,
