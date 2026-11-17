@@ -3,6 +3,10 @@ package aptos.experimental.execution.v1;
 import "aptos/transaction/v1/transaction.proto";
 
 message SubscribeRequest {}
+enum DataFormat {
+  JSON = 0;
+  BCS = 1;
+}
 // Live-only, best-effort observations. Events are EXECUTED, never COMMITTED.
 message TransactionId {
   bytes hash = 1;
@@ -19,6 +23,11 @@ message ExecutedTransactionData {
   // Populated on incomplete conversion for consumers with their own BCS schemas.
   bytes raw_events_bcs = 7;
   bytes raw_write_set_bcs = 8;
+  // BCS schema 1: aptos_types::transaction::TransactionOutput (v1.50.1).
+  // Includes WriteSet, ContractEvents, gas_used and status; auxiliary_data is skipped.
+  bytes execution_output_bcs = 9;
+  // aptos_types::transaction::Transaction, for hash and entry-function identification.
+  bytes transaction_bcs = 10;
 }
 message ProbeEvent {
   bool ready = 1;
@@ -35,6 +44,8 @@ message ProbeEvent {
   uint64 dropped_blocks = 11;
   bool include_data = 12;
   repeated ExecutedTransactionData transaction_data = 13;
+  DataFormat data_format = 14;
+  uint32 bcs_schema_version = 15;
 }
 service ExecutionProbe {
   rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);

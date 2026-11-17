@@ -2,6 +2,7 @@
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 pub mod compare;
+pub mod decibel;
 mod packets;
 pub mod payload;
 pub mod wire;
@@ -66,6 +67,8 @@ struct Hub {
     events: broadcast::Sender<ProbeEvent>,
     dropped: AtomicU64,
     include_data: bool,
+    data_format: wire::DataFormat,
+    bcs_schema_version: u32,
 }
 #[derive(Clone)]
 pub struct Publisher {
@@ -139,6 +142,16 @@ fn start_listener_with_data(
         events,
         dropped: AtomicU64::new(0),
         include_data: context.is_some(),
+        data_format: context
+            .as_ref()
+            .map_or(wire::DataFormat::Json, |c| c.wire_format()),
+        bcs_schema_version: context.as_ref().map_or(0, |c| {
+            if c.wire_format() == wire::DataFormat::Bcs {
+                wire::BCS_SCHEMA_VERSION
+            } else {
+                0
+            }
+        }),
     });
     let (sender, mut receiver) = mpsc::channel::<Observation>(16);
     let publisher = Publisher {
@@ -229,6 +242,8 @@ impl ExecutionProbe for Service {
                 chain_id: hub.chain,
                 dropped_blocks: hub.dropped.load(Ordering::Relaxed),
                 include_data: hub.include_data,
+                data_format: hub.data_format as i32,
+                bcs_schema_version: hub.bcs_schema_version,
                 ..Default::default()
             }))
             .await
@@ -339,6 +354,8 @@ mod tests {
             events,
             dropped: AtomicU64::new(0),
             include_data: false,
+            data_format: wire::DataFormat::Json,
+            bcs_schema_version: 0,
         });
         let _sub = hub.events.subscribe();
         let (sender, _receiver) = mpsc::channel(16);
@@ -365,6 +382,8 @@ mod tests {
             events,
             dropped: AtomicU64::new(0),
             include_data: false,
+            data_format: wire::DataFormat::Json,
+            bcs_schema_version: 0,
         });
         let mut stream = Service(hub.clone())
             .subscribe(Request::new(SubscribeRequest {}))
@@ -427,6 +446,15 @@ mod tests {
     }
     #[tokio::test]
     async fn actual_grpc_data_mode_carries_typed_output() {
+        grpc_data_mode(aptos_config::config::ExecutionProbeDataFormat::Json).await;
+    }
+    #[tokio::test]
+    async fn actual_grpc_bcs_mode_never_reads_database() {
+        grpc_data_mode(aptos_config::config::ExecutionProbeDataFormat::Bcs).await;
+    }
+    async fn grpc_data_mode(format: aptos_config::config::ExecutionProbeDataFormat) {
+        struct NoReadDb;
+        impl aptos_storage_interface::DbReader for NoReadDb {}
         struct OutputDb(aptos_storage_interface::state_store::state::State);
         impl aptos_storage_interface::DbReader for OutputDb {
             fn get_persisted_state(&self) -> aptos_storage_interface::Result<(Arc<dyn aptos_storage_interface::state_store::state_view::hot_state_view::HotStateView>,aptos_storage_interface::state_store::state::State)>{
@@ -442,8 +470,13 @@ mod tests {
             listener,
             4,
             Some(payload::DataContext {
-                db,
+                db: if format == aptos_config::config::ExecutionProbeDataFormat::Bcs {
+                    Arc::new(NoReadDb)
+                } else {
+                    db
+                },
                 indexer_reader: None,
+                format,
             }),
         )
         .unwrap();
@@ -465,6 +498,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(event.include_data);
+        if format == aptos_config::config::ExecutionProbeDataFormat::Bcs {
+            assert_eq!(event.data_format, wire::DataFormat::Bcs as i32);
+            assert_eq!(event.bcs_schema_version, wire::BCS_SCHEMA_VERSION);
+            let data = &event.transaction_data[0];
+            let transaction: Transaction = bcs::from_bytes(&data.transaction_bcs).unwrap();
+            assert_eq!(transaction.committed_hash().to_vec(), data.hash);
+            let output: TransactionOutput = bcs::from_bytes(&data.execution_output_bcs).unwrap();
+            assert_eq!(
+                output.status(),
+                &TransactionStatus::Keep(ExecutionStatus::Success)
+            );
+            assert!(data.events.is_empty() && data.write_set_changes.is_empty());
+        }
         assert_eq!(event.transaction_data.len(), 1);
         assert_eq!(event.transaction_data[0].hash, event.transactions[0].hash);
         assert!(

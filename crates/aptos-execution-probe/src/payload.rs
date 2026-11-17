@@ -4,6 +4,7 @@
 use crate::wire::{ExecutedTransactionData, TransactionId};
 use anyhow::{bail, Result};
 use aptos_api_types::{MoveConverter, WriteSetChange};
+use aptos_config::config::ExecutionProbeDataFormat;
 use aptos_executor_types::execution_output::ExecutionOutput;
 use aptos_indexer_grpc_fullnode::convert::{convert_events, convert_write_set_changes};
 use aptos_storage_interface::{
@@ -23,14 +24,36 @@ use std::sync::Arc;
 pub struct DataContext {
     pub db: Arc<dyn DbReader>,
     pub indexer_reader: Option<Arc<dyn IndexerReader>>,
+    pub format: ExecutionProbeDataFormat,
 }
 
 impl DataContext {
+    pub(crate) fn wire_format(&self) -> crate::wire::DataFormat {
+        match self.format {
+            ExecutionProbeDataFormat::Json => crate::wire::DataFormat::Json,
+            ExecutionProbeDataFormat::Bcs => crate::wire::DataFormat::Bcs,
+        }
+    }
+
     pub(crate) fn convert(
         &self,
         output: &ExecutionOutput,
         ids: &[TransactionId],
     ) -> Vec<ExecutedTransactionData> {
+        // The BCS path never constructs a state view or resolves Move layouts.
+        if self.format == ExecutionProbeDataFormat::Bcs {
+            return ids
+                .iter()
+                .map(|id| {
+                    let index = id.transaction_index as usize;
+                    convert_bcs_one(
+                        id,
+                        &output.to_commit.transactions[index],
+                        &output.to_commit.transaction_outputs[index],
+                    )
+                })
+                .collect();
+        }
         match self.try_convert(output, ids) {
             Ok(data) => data,
             Err(error) => ids
@@ -89,6 +112,33 @@ impl DataContext {
             })
             .collect()
     }
+}
+
+fn convert_bcs_one(
+    id: &TransactionId,
+    transaction: &aptos_types::transaction::Transaction,
+    output: &TransactionOutput,
+) -> ExecutedTransactionData {
+    let mut data = ExecutedTransactionData {
+        hash: id.hash.clone(),
+        transaction_index: id.transaction_index,
+        ..Default::default()
+    };
+    match (bcs::to_bytes(output), bcs::to_bytes(transaction)) {
+        (Ok(execution), Ok(transaction)) => {
+            data.execution_output_bcs = execution;
+            data.transaction_bcs = transaction;
+            data.data_complete = true;
+        },
+        (a, b) => {
+            data.conversion_error = format!(
+                "BCS serialization: output={:?}, transaction={:?}",
+                a.err(),
+                b.err()
+            )
+        },
+    }
+    data
 }
 
 fn convert_one<S: StateView>(
@@ -177,6 +227,51 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn bcs_serialization_roundtrips_real_execution_output_without_move_conversion() {
+        let aptos_api_types::TransactionData::OnChain(data) =
+            bcs::from_bytes(include_bytes!("../tests/data/place-order-8094725931.bcs")).unwrap()
+        else {
+            panic!("expected on-chain data")
+        };
+        let output = TransactionOutput::new(
+            data.changes,
+            data.events,
+            data.info.gas_used(),
+            TransactionStatus::Keep(data.info.status().clone()),
+            TransactionAuxiliaryData::None,
+        );
+        let id = TransactionId {
+            hash: data.transaction.committed_hash().to_vec(),
+            transaction_index: 7,
+        };
+        let encoded = convert_bcs_one(&id, &data.transaction, &output);
+        assert!(encoded.data_complete);
+        assert_eq!(encoded.transaction_index, 7);
+        assert_eq!(
+            bcs::from_bytes::<TransactionOutput>(&encoded.execution_output_bcs).unwrap(),
+            output
+        );
+        assert_eq!(
+            bcs::from_bytes::<aptos_types::transaction::Transaction>(&encoded.transaction_bcs)
+                .unwrap(),
+            data.transaction
+        );
+        assert!(encoded.events.is_empty() && encoded.write_set_changes.is_empty());
+        assert!(encoded.raw_events_bcs.is_empty() && encoded.raw_write_set_bcs.is_empty());
+        // This DbReader has no methods implemented; any state read would panic.
+        let context = DataContext {
+            db: Arc::new(MockDbReaderWriter),
+            indexer_reader: None,
+            format: ExecutionProbeDataFormat::Bcs,
+        };
+        let execution = ExecutionOutput::new_dummy_with_input_txns(vec![data.transaction]);
+        let frames = context.convert(&execution, &[TransactionId {
+            transaction_index: 0,
+            ..id
+        }]);
+        assert!(frames[0].data_complete);
+    }
     #[test]
     fn resource_and_event_json_use_the_same_indexer_types() {
         let module = move_binary_format::file_format::basic_test_module();

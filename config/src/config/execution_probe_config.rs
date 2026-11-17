@@ -4,13 +4,23 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+/// Encoding of optional execution output. JSON preserves the Indexer-shaped feed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionProbeDataFormat {
+    #[default]
+    Json,
+    Bcs,
+}
+
 /// Experimental live-only execution identity feed, disabled by default.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionProbeConfig {
     pub enabled: bool,
-    /// Include Indexer-typed events and changes in the executed envelope.
+    /// Include execution output in the selected data_format.
     pub include_data: bool,
+    pub data_format: ExecutionProbeDataFormat,
     pub address: SocketAddr,
 }
 impl Default for ExecutionProbeConfig {
@@ -18,6 +28,7 @@ impl Default for ExecutionProbeConfig {
         Self {
             enabled: false,
             include_data: false,
+            data_format: ExecutionProbeDataFormat::Json,
             address: "127.0.0.1:50052".parse().unwrap(),
         }
     }
@@ -31,6 +42,11 @@ mod tests {
         let config: ExecutionProbeConfig = serde_yaml::from_str("{}").unwrap();
         assert!(!config.enabled);
         assert!(!config.include_data);
+        assert_eq!(config.data_format, ExecutionProbeDataFormat::Json);
+        let bcs: ExecutionProbeConfig =
+            serde_yaml::from_str("include_data: true\ndata_format: bcs").unwrap();
+        assert_eq!(bcs.data_format, ExecutionProbeDataFormat::Bcs);
+        assert!(serde_yaml::from_str::<ExecutionProbeConfig>("data_format: unknown").is_err());
         assert_eq!(config.address.to_string(), "127.0.0.1:50052");
         let explicit: ExecutionProbeConfig =
             serde_yaml::from_str("enabled: true\ninclude_data: true\naddress: 127.0.0.1:51234")

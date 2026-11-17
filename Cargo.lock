@@ -1633,6 +1633,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aptos-api-types",
+ "aptos-config",
  "aptos-crypto",
  "aptos-executor-types",
  "aptos-indexer-grpc-fullnode",

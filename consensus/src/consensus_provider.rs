@@ -174,6 +174,7 @@ pub fn start_consensus_observer(
                         aptos_execution_probe::payload::DataContext {
                             db: aptos_db.reader.clone(),
                             indexer_reader: probe_indexer_reader,
+                            format: node_config.execution_probe.data_format,
                         }
                     }),
                 )

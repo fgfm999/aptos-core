@@ -3,6 +3,14 @@
 
 // Wire definitions mirror proto/execution_probe.proto. The tonic service module
 // is generated using the repository's existing server-streaming service template.
+pub const BCS_SCHEMA_VERSION: u32 = 1;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum DataFormat {
+    Json = 0,
+    Bcs = 1,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SubscribeRequest {}
 #[derive(Clone, PartialEq, prost::Message)]
@@ -30,6 +38,10 @@ pub struct ExecutedTransactionData {
     pub raw_events_bcs: Vec<u8>,
     #[prost(bytes = "vec", tag = "8")]
     pub raw_write_set_bcs: Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub execution_output_bcs: Vec<u8>,
+    #[prost(bytes = "vec", tag = "10")]
+    pub transaction_bcs: Vec<u8>,
 }
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProbeEvent {
@@ -59,5 +71,9 @@ pub struct ProbeEvent {
     pub include_data: bool,
     #[prost(message, repeated, tag = "13")]
     pub transaction_data: Vec<ExecutedTransactionData>,
+    #[prost(enumeration = "DataFormat", tag = "14")]
+    pub data_format: i32,
+    #[prost(uint32, tag = "15")]
+    pub bcs_schema_version: u32,
 }
 include!("service.rs");

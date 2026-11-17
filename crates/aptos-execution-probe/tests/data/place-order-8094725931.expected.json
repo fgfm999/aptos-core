@@ -1,0 +1,133 @@
+{
+  "version": "8094725931",
+  "hash": "0x9146c8bfe7b44c7ffb91299ad3c0fe7134f48d318412a24d44d43b2653bf9fe9",
+  "function": "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::dex_accounts_entry::place_order_to_subaccount",
+  "events": [
+    {
+      "guid": {
+        "creation_number": "0",
+        "account_address": "0x0"
+      },
+      "sequence_number": "0",
+      "type": "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types::OrderEvent",
+      "data": {
+        "__variant__": "V1",
+        "cancellation_reason": {
+          "vec": []
+        },
+        "client_order_id": {
+          "vec": [
+            "MM:1791349437025546"
+          ]
+        },
+        "details": "",
+        "is_bid": true,
+        "is_taker": true,
+        "market": "0x4c212c1adb16bd2f3a2bb74806e71e98532da233ee94b4df39b71b78fbb2d5a1",
+        "metadata_bytes": "0x000000000000000000",
+        "order_id": "170141599883691407673088290519521427456",
+        "orig_size": "1792000000",
+        "parent": "0x4d8cc47ee3545fcbe87fcef21bd0ff39377c98efebb8f55a8b97aba928098370",
+        "price": "660130000",
+        "remaining_size": "1792000000",
+        "size_delta": "1792000000",
+        "status": {
+          "__variant__": "ACKNOWLEDGED"
+        },
+        "time_in_force": {
+          "__variant__": "POST_ONLY"
+        },
+        "trigger_condition": {
+          "vec": []
+        },
+        "user": "0xd6b4dccb59e8c9bd451e2e7d935039bef1e6de51ffbab2f77b1e9de73996b301"
+      }
+    },
+    {
+      "guid": {
+        "creation_number": "0",
+        "account_address": "0x0"
+      },
+      "sequence_number": "0",
+      "type": "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types::OrderEvent",
+      "data": {
+        "__variant__": "V1",
+        "cancellation_reason": {
+          "vec": []
+        },
+        "client_order_id": {
+          "vec": [
+            "MM:1791349437025546"
+          ]
+        },
+        "details": "",
+        "is_bid": true,
+        "is_taker": false,
+        "market": "0x4c212c1adb16bd2f3a2bb74806e71e98532da233ee94b4df39b71b78fbb2d5a1",
+        "metadata_bytes": "0x000000000000000000",
+        "order_id": "170141599883691407673088290519521427456",
+        "orig_size": "1792000000",
+        "parent": "0x4d8cc47ee3545fcbe87fcef21bd0ff39377c98efebb8f55a8b97aba928098370",
+        "price": "660130000",
+        "remaining_size": "1792000000",
+        "size_delta": "1792000000",
+        "status": {
+          "__variant__": "OPEN"
+        },
+        "time_in_force": {
+          "__variant__": "POST_ONLY"
+        },
+        "trigger_condition": {
+          "vec": []
+        },
+        "user": "0xd6b4dccb59e8c9bd451e2e7d935039bef1e6de51ffbab2f77b1e9de73996b301"
+      }
+    }
+  ],
+  "write_resource": [
+    {
+      "address": "0xa",
+      "state_key_hash": "0x1db5441d8fa4229c5844f73fd66da4ad8176cb8793d8b3a7f6ca858722030043",
+      "data": {
+        "type": "0x1::object::ObjectCore",
+        "data": {
+          "allow_ungated_transfer": true,
+          "guid_creation_num": "1125899906842625",
+          "owner": "0x1",
+          "transfer_events": {
+            "counter": "0",
+            "guid": {
+              "id": {
+                "addr": "0xa",
+                "creation_num": "1125899906842624"
+              }
+            }
+          }
+        }
+      },
+      "type": "write_resource"
+    },
+    {
+      "address": "0xe8f713f317d7e3ef892699303012734dcac86563ac26675602e5e63460aa7a25",
+      "state_key_hash": "0xfc9f65f221fd35303b4f2f3dbc08c1680519a97dd529943c4a651a7f366cf847",
+      "data": {
+        "type": "0x1::object::ObjectCore",
+        "data": {
+          "allow_ungated_transfer": false,
+          "guid_creation_num": "1125899906842625",
+          "owner": "0xd503b95164384a5ebbccbb5c4bdc8b4a5893d9651e9953abda8e1c22fcc1181d",
+          "transfer_events": {
+            "counter": "0",
+            "guid": {
+              "id": {
+                "addr": "0xe8f713f317d7e3ef892699303012734dcac86563ac26675602e5e63460aa7a25",
+                "creation_num": "1125899906842624"
+              }
+            }
+          }
+        }
+      },
+      "type": "write_resource"
+    }
+  ]
+}

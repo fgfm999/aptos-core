@@ -56,6 +56,8 @@ pub(crate) fn build(
             transactions: ids,
             transaction_data: data,
             include_data: context.is_some(),
+            data_format: hub.data_format as i32,
+            bcs_schema_version: hub.bcs_schema_version,
             dropped_blocks: hub.dropped.load(Ordering::Relaxed),
         };
         if event.encoded_len() > MAX_BYTES {

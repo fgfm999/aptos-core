@@ -23,7 +23,7 @@ use tokio_stream::{
 };
 use tonic::{Request, Response, Status};
 type Events<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
-struct MockProbe(Arc<Notify>);
+struct MockProbe(Arc<Notify>, bool);
 #[tonic::async_trait]
 impl ExecutionProbe for MockProbe {
     type SubscribeStream = Events<ProbeEvent>;
@@ -34,9 +34,12 @@ impl ExecutionProbe for MockProbe {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let (tx, rx) = mpsc::channel(4);
         let notify = self.0.clone();
+        let bcs = self.1;
         tx.send(Ok(ProbeEvent {
             ready: true,
             include_data: true,
+            data_format: i32::from(bcs),
+            bcs_schema_version: u32::from(bcs),
             session_id: "fixture".into(),
             chain_id: 4,
             ..Default::default()
@@ -51,10 +54,14 @@ impl ExecutionProbe for MockProbe {
                     chain_id: 4,
                     sequence: 1,
                     include_data: true,
+                    data_format: i32::from(bcs),
+                    bcs_schema_version: u32::from(bcs),
                     transaction_data: vec![aptos_execution_probe::wire::ExecutedTransactionData {
                         hash: vec![9; 32],
                         transaction_index: 0,
                         data_complete: true,
+                        execution_output_bcs: if bcs { vec![1, 2, 3] } else { vec![] },
+                        transaction_bcs: if bcs { vec![4, 5] } else { vec![] },
                         events: vec![aptos_protos::transaction::v1::Event::default()],
                         write_set_changes: vec![
                             aptos_protos::transaction::v1::WriteSetChange::default(),
@@ -112,6 +119,13 @@ impl RawData for MockIndexer {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn comparison_binary_consumes_both_grpc_streams() {
+    compare_mode(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn comparison_binary_consumes_bcs_data() {
+    compare_mode(true).await;
+}
+async fn compare_mode(bcs: bool) {
     let p = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let p_addr = p.local_addr().unwrap();
     let i = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,7 +135,7 @@ async fn comparison_binary_consumes_both_grpc_streams() {
     let notify = Arc::new(Notify::new());
     let p_task = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(ExecutionProbeServer::new(MockProbe(notify.clone())))
+            .add_service(ExecutionProbeServer::new(MockProbe(notify.clone(), bcs)))
             .serve_with_incoming(TcpListenerStream::new(p)),
     );
     let i_task = tokio::spawn(
@@ -166,6 +180,8 @@ async fn comparison_binary_consumes_both_grpc_streams() {
         serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
     assert_eq!(report["samples"], 1);
     assert_eq!(report["include_data"], true);
+    assert_eq!(report["data_format"], if bcs { "bcs" } else { "json" });
+    assert_eq!(report["bcs_bytes_received"], if bcs { 5 } else { 0 });
     assert_eq!(report["data_transactions"], 1);
     assert_eq!(report["events_received"], 1);
     assert_eq!(report["write_set_changes_received"], 1);

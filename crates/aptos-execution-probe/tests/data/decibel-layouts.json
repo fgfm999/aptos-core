@@ -1,0 +1,277 @@
+{
+  "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types": [
+    {
+      "name": "OrderCancellationReason",
+      "is_native": false,
+      "is_event": false,
+      "is_enum": true,
+      "abilities": [
+        "copy",
+        "drop",
+        "store"
+      ],
+      "generic_type_params": [],
+      "fields": [],
+      "variants": [
+        {
+          "name": "PostOnlyViolation",
+          "fields": []
+        },
+        {
+          "name": "IOCViolation",
+          "fields": []
+        },
+        {
+          "name": "PositionUpdateViolation",
+          "fields": []
+        },
+        {
+          "name": "ReduceOnlyViolation",
+          "fields": []
+        },
+        {
+          "name": "ClearinghouseSettleViolation",
+          "fields": []
+        },
+        {
+          "name": "MaxFillLimitViolation",
+          "fields": []
+        },
+        {
+          "name": "DuplicateClientOrderIdViolation",
+          "fields": []
+        },
+        {
+          "name": "OrderPreCancelled",
+          "fields": []
+        },
+        {
+          "name": "PlaceMakerOrderViolation",
+          "fields": []
+        },
+        {
+          "name": "DeadMansSwitchExpired",
+          "fields": []
+        },
+        {
+          "name": "DisallowedSelfTrading",
+          "fields": []
+        },
+        {
+          "name": "OrderCancelledByUser",
+          "fields": []
+        },
+        {
+          "name": "OrderCancelledBySystem",
+          "fields": []
+        },
+        {
+          "name": "OrderCancelledBySystemDueToError",
+          "fields": []
+        },
+        {
+          "name": "ClearinghouseStoppedMatching",
+          "fields": []
+        }
+      ]
+    },
+    {
+      "name": "OrderEvent",
+      "is_native": false,
+      "is_event": true,
+      "is_enum": true,
+      "abilities": [
+        "copy",
+        "drop",
+        "store"
+      ],
+      "generic_type_params": [],
+      "fields": [],
+      "variants": [
+        {
+          "name": "V1",
+          "fields": [
+            {
+              "name": "parent",
+              "type": "address"
+            },
+            {
+              "name": "market",
+              "type": "address"
+            },
+            {
+              "name": "order_id",
+              "type": "u128"
+            },
+            {
+              "name": "client_order_id",
+              "type": "0x1::option::Option<0x1::string::String>"
+            },
+            {
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "name": "orig_size",
+              "type": "u64"
+            },
+            {
+              "name": "remaining_size",
+              "type": "u64"
+            },
+            {
+              "name": "size_delta",
+              "type": "u64"
+            },
+            {
+              "name": "price",
+              "type": "u64"
+            },
+            {
+              "name": "is_bid",
+              "type": "bool"
+            },
+            {
+              "name": "is_taker",
+              "type": "bool"
+            },
+            {
+              "name": "status",
+              "type": "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types::OrderStatus"
+            },
+            {
+              "name": "details",
+              "type": "0x1::string::String"
+            },
+            {
+              "name": "metadata_bytes",
+              "type": "vector<u8>"
+            },
+            {
+              "name": "time_in_force",
+              "type": "0x5::order_book_types::TimeInForce"
+            },
+            {
+              "name": "trigger_condition",
+              "type": "0x1::option::Option<0x5::order_book_types::TriggerCondition>"
+            },
+            {
+              "name": "cancellation_reason",
+              "type": "0x1::option::Option<0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06::market_types::OrderCancellationReason>"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OrderStatus",
+      "is_native": false,
+      "is_event": false,
+      "is_enum": true,
+      "abilities": [
+        "copy",
+        "drop",
+        "store"
+      ],
+      "generic_type_params": [],
+      "fields": [],
+      "variants": [
+        {
+          "name": "OPEN",
+          "fields": []
+        },
+        {
+          "name": "FILLED",
+          "fields": []
+        },
+        {
+          "name": "CANCELLED",
+          "fields": []
+        },
+        {
+          "name": "REJECTED",
+          "fields": []
+        },
+        {
+          "name": "SIZE_REDUCED",
+          "fields": []
+        },
+        {
+          "name": "ACKNOWLEDGED",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "0x5::order_book_types": [
+    {
+      "name": "TimeInForce",
+      "is_native": false,
+      "is_event": false,
+      "is_enum": true,
+      "abilities": [
+        "copy",
+        "drop",
+        "store"
+      ],
+      "generic_type_params": [],
+      "fields": [],
+      "variants": [
+        {
+          "name": "GTC",
+          "fields": []
+        },
+        {
+          "name": "POST_ONLY",
+          "fields": []
+        },
+        {
+          "name": "IOC",
+          "fields": []
+        }
+      ]
+    },
+    {
+      "name": "TriggerCondition",
+      "is_native": false,
+      "is_event": false,
+      "is_enum": true,
+      "abilities": [
+        "copy",
+        "drop",
+        "store"
+      ],
+      "generic_type_params": [],
+      "fields": [],
+      "variants": [
+        {
+          "name": "PriceMoveAbove",
+          "fields": [
+            {
+              "name": "_0",
+              "type": "u64"
+            }
+          ]
+        },
+        {
+          "name": "PriceMoveBelow",
+          "fields": [
+            {
+              "name": "_0",
+              "type": "u64"
+            }
+          ]
+        },
+        {
+          "name": "TimeBased",
+          "fields": [
+            {
+              "name": "_0",
+              "type": "u64"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
