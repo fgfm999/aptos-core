@@ -54,6 +54,7 @@ pub struct BlockExecutor<V> {
     pub db: DbReaderWriter,
     inner: RwLock<Option<BlockExecutorInner<V>>>,
     execution_lock: Mutex<()>,
+    probe: Option<aptos_execution_probe::Publisher>,
 }
 
 impl<V> BlockExecutor<V>
@@ -65,7 +66,13 @@ where
             db,
             inner: RwLock::new(None),
             execution_lock: Mutex::new(()),
+            probe: None,
         }
+    }
+
+    pub fn with_execution_probe(mut self, probe: Option<aptos_execution_probe::Publisher>) -> Self {
+        self.probe = probe;
+        self
     }
 
     fn maybe_initialize(&self) -> Result<()> {
@@ -109,13 +116,20 @@ where
         self.maybe_initialize()?;
         // guarantee only one block being executed at a time
         let _guard = self.execution_lock.lock();
-        self.inner
+        let block_id = block.block_id;
+        let capture = self.probe.as_ref().is_some_and(|probe| probe.interested());
+        let output = self
+            .inner
             .read()
             .as_ref()
             .ok_or_else(|| ExecutorError::InternalError {
                 error: "BlockExecutor is not reset".into(),
             })?
-            .execute_and_update_state(block, parent_block_id, onchain_config)
+            .execute_and_update_state(block, parent_block_id, onchain_config, capture)?;
+        if let (Some(probe), Some(output)) = (&self.probe, output) {
+            probe.publish(block_id, parent_block_id, output);
+        }
+        Ok(())
     }
 
     fn ledger_update(
@@ -203,7 +217,8 @@ where
         block: ExecutableBlock,
         parent_block_id: HashValue,
         onchain_config: BlockExecutorConfigFromOnchain,
-    ) -> ExecutorResult<()> {
+        capture_probe: bool,
+    ) -> ExecutorResult<Option<aptos_executor_types::execution_output::ExecutionOutput>> {
         let _timer = BLOCK_EXECUTION_WORKFLOW_WHOLE.start_timer();
         let ExecutableBlock {
             block_id,
@@ -321,6 +336,7 @@ where
             }
         }
 
+        let probe_output = capture_probe.then(|| execution_output.clone());
         let output = PartialStateComputeResult::new(execution_output);
         let _ = self
             .block_tree
@@ -336,7 +352,7 @@ where
                 "OBSERVER_EXECUTOR_TIMING"
             );
         }
-        Ok(())
+        Ok(probe_output)
     }
 
     /// Advances the position base, and refuses a block that can no

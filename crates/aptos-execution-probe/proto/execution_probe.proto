@@ -1,0 +1,26 @@
+syntax = "proto3";
+package aptos.experimental.execution.v1;
+
+message SubscribeRequest {}
+// Live-only, best-effort observations. Events are EXECUTED, never COMMITTED.
+message TransactionId {
+  bytes hash = 1;
+  uint32 transaction_index = 2;
+}
+message ProbeEvent {
+  bool ready = 1;
+  string session_id = 2;
+  uint32 chain_id = 3;
+  uint64 sequence = 4;
+  bytes block_id = 5;
+  bytes parent_block_id = 6;
+  // Diagnostic only. Cross-host subtraction requires clock synchronization.
+  uint64 execution_done_unix_nanos = 7;
+  uint32 chunk_index = 8;
+  bool last_chunk = 9;
+  repeated TransactionId transactions = 10;
+  uint64 dropped_blocks = 11;
+}
+service ExecutionProbe {
+  rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);
+}

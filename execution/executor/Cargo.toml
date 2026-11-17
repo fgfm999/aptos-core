@@ -24,6 +24,7 @@ failpoints = ["fail/failpoints", "aptos-vm/failpoints"]
 consensus-only-perf-test = []
 
 [dependencies]
+aptos-execution-probe = { workspace = true }
 anyhow = { workspace = true }
 aptos-block-executor = { workspace = true }
 aptos-config = { workspace = true }
@@ -51,6 +52,7 @@ rayon = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
 aptos-cached-packages = { workspace = true }
 aptos-config = { workspace = true }
 aptos-db = { workspace = true }

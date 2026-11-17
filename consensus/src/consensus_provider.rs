@@ -1,6 +1,5 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
-
 use crate::{
     consensus_observer::{
         network::{
@@ -31,7 +30,9 @@ use aptos_executor::block_executor::BlockExecutor;
 use aptos_logger::prelude::*;
 use aptos_mempool::QuorumStoreRequest;
 use aptos_network::application::interface::{NetworkClient, NetworkServiceEvents};
-use aptos_storage_interface::DbReaderWriter;
+use aptos_storage_interface::{
+    state_store::state_view::db_state_view::LatestDbStateCheckpointView, DbReaderWriter,
+};
 use aptos_time_service::TimeService;
 use aptos_validator_transaction_pool::VTxnPoolState;
 use aptos_vm::aptos_vm::AptosVMBlockExecutor;
@@ -157,8 +158,28 @@ pub fn start_consensus_observer(
             consensus_to_mempool_sender.clone(),
             node_config.consensus.mempool_executed_txn_timeout_ms,
         ));
+        let probe = if node_config.execution_probe.enabled {
+            let view = aptos_db
+                .reader
+                .latest_state_checkpoint_view()
+                .expect("execution probe state view");
+            let chain = <aptos_types::account_config::ChainIdResource as aptos_types::on_chain_config::OnChainConfig>::fetch_config(&view)
+                .expect("execution probe chain ID read").expect("execution probe chain ID missing");
+            Some(
+                aptos_execution_probe::start(
+                    node_config.execution_probe.address,
+                    chain.chain_id().id() as u32,
+                )
+                .expect("execution probe startup failed"),
+            )
+        } else {
+            None
+        };
         let execution_proxy = ExecutionProxy::new(
-            Arc::new(BlockExecutor::<AptosVMBlockExecutor>::new(aptos_db.clone())),
+            Arc::new(
+                BlockExecutor::<AptosVMBlockExecutor>::new(aptos_db.clone())
+                    .with_execution_probe(probe),
+            ),
             txn_notifier,
             state_sync_notifier,
             node_config.transaction_filters.execution_filter.clone(),

@@ -916,3 +916,64 @@ proptest! {
         prop_assert_eq!(root_hash, expected_root_hash);
     }
 }
+
+#[test]
+fn execution_probe_publishes_before_ledger_commit() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let publisher = aptos_execution_probe::start(address, 4).unwrap();
+        let mut fixture = TestExecutor::new();
+        fixture.executor =
+            BlockExecutor::new(fixture.db.clone()).with_execution_probe(Some(publisher));
+        let mut client =
+            aptos_execution_probe::wire::execution_probe_client::ExecutionProbeClient::connect(
+                format!("http://{address}"),
+            )
+            .await
+            .unwrap();
+        let mut stream = client
+            .subscribe(aptos_execution_probe::wire::SubscribeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().unwrap().ready);
+        let before = fixture
+            .db
+            .reader
+            .get_latest_ledger_info()
+            .unwrap()
+            .ledger_info()
+            .version();
+        let txn = encode_mint_transaction(gen_address(77), 100);
+        let hash = txn.committed_hash().to_vec();
+        let parent = fixture.executor.committed_block_id();
+        fixture
+            .executor
+            .execute_and_update_state(
+                (gen_block_id(123), block(vec![txn])).into(),
+                parent,
+                TEST_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
+            )
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.block_id, gen_block_id(123).to_vec());
+        assert!(event.transactions.iter().any(|t| t.hash == hash));
+        assert_eq!(
+            fixture
+                .db
+                .reader
+                .get_latest_ledger_info()
+                .unwrap()
+                .ledger_info()
+                .version(),
+            before
+        );
+    });
+}

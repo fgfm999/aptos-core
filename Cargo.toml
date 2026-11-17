@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "crates/aptos-execution-probe",
     "api",
     "api/openapi-spec-generator",
     "api/test-context",
@@ -318,6 +319,7 @@ repository = "https://github.com/aptos-labs/aptos-core"
 rust-version = "1.95"
 
 [workspace.dependencies]
+aptos-execution-probe = { path = "crates/aptos-execution-probe" }
 # Internal crate dependencies.
 # Please do not add any test features here: they should be declared by the individual crate.
 aptos = { path = "crates/aptos" }

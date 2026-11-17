@@ -53,6 +53,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub execution: ExecutionConfig,
     #[serde(default)]
+    pub execution_probe: super::ExecutionProbeConfig,
+    #[serde(default)]
     pub failpoints: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub full_node_networks: Vec<NetworkConfig>,

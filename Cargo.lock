@@ -1049,6 +1049,7 @@ dependencies = [
  "aptos-dkg",
  "aptos-enum-conversion-derive",
  "aptos-event-notifications",
+ "aptos-execution-probe",
  "aptos-executor",
  "aptos-executor-test-helpers",
  "aptos-executor-types",
@@ -1627,6 +1628,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aptos-execution-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aptos-crypto",
+ "aptos-executor-types",
+ "aptos-logger",
+ "aptos-metrics-core",
+ "aptos-protos 1.3.1",
+ "aptos-types",
+ "clap 4.6.7",
+ "hex",
+ "once_cell",
+ "prost 0.13.4",
+ "reqwest 0.11.23",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "uuid 1.29.0",
+]
+
+[[package]]
 name = "aptos-executor"
 version = "0.1.0"
 dependencies = [
@@ -1639,6 +1664,7 @@ dependencies = [
  "aptos-db",
  "aptos-db-indexer",
  "aptos-drop-helper",
+ "aptos-execution-probe",
  "aptos-executor-service",
  "aptos-executor-test-helpers",
  "aptos-executor-types",
@@ -1668,6 +1694,7 @@ dependencies = [
  "rand 0.7.3",
  "rayon",
  "serde",
+ "tokio",
 ]
 
 [[package]]

@@ -13,6 +13,8 @@ mod dag_consensus_config;
 mod dkg_config;
 mod error;
 mod execution_config;
+mod execution_probe_config;
+pub use execution_probe_config::ExecutionProbeConfig;
 mod gas_estimation_config;
 mod identity_config;
 mod indexer_grpc_config;

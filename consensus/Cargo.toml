@@ -28,6 +28,7 @@ fuzzing = [
 failpoints = ["fail/failpoints"]
 
 [dependencies]
+aptos-execution-probe = { workspace = true }
 anyhow = { workspace = true }
 aptos-batch-encryption = { workspace = true }
 aptos-bitvec = { workspace = true }
