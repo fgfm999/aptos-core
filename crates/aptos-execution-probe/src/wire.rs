@@ -13,6 +13,25 @@ pub struct TransactionId {
     pub transaction_index: u32,
 }
 #[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecutedTransactionData {
+    #[prost(bytes = "vec", tag = "1")]
+    pub hash: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub transaction_index: u32,
+    #[prost(message, repeated, tag = "3")]
+    pub events: Vec<aptos_protos::transaction::v1::Event>,
+    #[prost(message, repeated, tag = "4")]
+    pub write_set_changes: Vec<aptos_protos::transaction::v1::WriteSetChange>,
+    #[prost(bool, tag = "5")]
+    pub data_complete: bool,
+    #[prost(string, tag = "6")]
+    pub conversion_error: String,
+    #[prost(bytes = "vec", tag = "7")]
+    pub raw_events_bcs: Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub raw_write_set_bcs: Vec<u8>,
+}
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct ProbeEvent {
     #[prost(bool, tag = "1")]
     pub ready: bool,
@@ -36,5 +55,9 @@ pub struct ProbeEvent {
     pub transactions: Vec<TransactionId>,
     #[prost(uint64, tag = "11")]
     pub dropped_blocks: u64,
+    #[prost(bool, tag = "12")]
+    pub include_data: bool,
+    #[prost(message, repeated, tag = "13")]
+    pub transaction_data: Vec<ExecutedTransactionData>,
 }
 include!("service.rs");

@@ -139,6 +139,7 @@ pub fn start_consensus_observer(
     consensus_to_mempool_sender: mpsc::Sender<QuorumStoreRequest>,
     aptos_db: DbReaderWriter,
     reconfig_events: Option<ReconfigNotificationListener<DbBackedOnChainConfig>>,
+    probe_indexer_reader: Option<Arc<dyn aptos_types::indexer::indexer_db_reader::IndexerReader>>,
 ) {
     // Create the (dummy) consensus network client
     let (self_sender, _self_receiver) =
@@ -166,9 +167,15 @@ pub fn start_consensus_observer(
             let chain = <aptos_types::account_config::ChainIdResource as aptos_types::on_chain_config::OnChainConfig>::fetch_config(&view)
                 .expect("execution probe chain ID read").expect("execution probe chain ID missing");
             Some(
-                aptos_execution_probe::start(
+                aptos_execution_probe::start_configured(
                     node_config.execution_probe.address,
                     chain.chain_id().id() as u32,
+                    node_config.execution_probe.include_data.then(|| {
+                        aptos_execution_probe::payload::DataContext {
+                            db: aptos_db.reader.clone(),
+                            indexer_reader: probe_indexer_reader,
+                        }
+                    }),
                 )
                 .expect("execution probe startup failed"),
             )

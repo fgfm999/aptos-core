@@ -36,6 +36,7 @@ impl ExecutionProbe for MockProbe {
         let notify = self.0.clone();
         tx.send(Ok(ProbeEvent {
             ready: true,
+            include_data: true,
             session_id: "fixture".into(),
             chain_id: 4,
             ..Default::default()
@@ -49,6 +50,17 @@ impl ExecutionProbe for MockProbe {
                     session_id: "fixture".into(),
                     chain_id: 4,
                     sequence: 1,
+                    include_data: true,
+                    transaction_data: vec![aptos_execution_probe::wire::ExecutedTransactionData {
+                        hash: vec![9; 32],
+                        transaction_index: 0,
+                        data_complete: true,
+                        events: vec![aptos_protos::transaction::v1::Event::default()],
+                        write_set_changes: vec![
+                            aptos_protos::transaction::v1::WriteSetChange::default(),
+                        ],
+                        ..Default::default()
+                    }],
                     last_chunk: true,
                     block_id: vec![8; 32],
                     transactions: vec![TransactionId {
@@ -153,6 +165,11 @@ async fn comparison_binary_consumes_both_grpc_streams() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
     assert_eq!(report["samples"], 1);
+    assert_eq!(report["include_data"], true);
+    assert_eq!(report["data_transactions"], 1);
+    assert_eq!(report["events_received"], 1);
+    assert_eq!(report["write_set_changes_received"], 1);
+    assert_eq!(report["data_incomplete"], false);
     assert_eq!(report["measurement_impaired"], false);
     let csv = std::fs::read_to_string(out.join("matches.csv")).unwrap();
     assert!(csv.contains(&hex::encode([9u8; 32])));

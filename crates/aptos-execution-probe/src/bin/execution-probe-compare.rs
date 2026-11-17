@@ -123,6 +123,10 @@ async fn main() -> Result<()> {
     let mut last_sequence: Option<(u64, u32, bool)> = None;
     let mut dropped_blocks = 0u64;
     let mut disconnect = None;
+    let mut data_transactions = 0u64;
+    let mut incomplete_data_transactions = 0u64;
+    let mut events_received = 0u64;
+    let mut changes_received = 0u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
@@ -137,7 +141,15 @@ async fn main() -> Result<()> {
                     && !(event.sequence==seq && !last && event.chunk_index==chunk+1 || event.sequence==seq+1 && last && event.chunk_index==0) { sequence_gaps+=1; }
                 if last_sequence.is_none() && event.chunk_index != 0 { sequence_gaps += 1; }
                 last_sequence=Some((event.sequence,event.chunk_index,event.last_chunk));
+                if event.include_data != ready.include_data { disconnect=Some("probe data mode changed".into()); break; }
+                if ready.include_data && (event.transaction_data.len()!=event.transactions.len() || event.transaction_data.iter().zip(&event.transactions).any(|(d,id)| d.hash!=id.hash || d.transaction_index!=id.transaction_index)) { disconnect=Some("probe data/identity mismatch".into()); break; }
                 if received >= warm {
+                    for d in &event.transaction_data {
+                        data_transactions += 1;
+                        incomplete_data_transactions += u64::from(!d.data_complete);
+                        events_received += d.events.len() as u64;
+                        changes_received += d.write_set_changes.len() as u64;
+                    }
                     for t in event.transactions {
                         if t.hash.len()!=32 { disconnect=Some("invalid probe hash".into()); break; }
                         matcher.probe(hex::encode(t.hash), hex::encode(&event.block_id), received.as_secs_f64()*1000.0);
@@ -193,13 +205,14 @@ async fn main() -> Result<()> {
     let summary = json!({"session_id":ready.session_id,"chain_id":ready.chain_id,"start_version":version+1,
         "probe_endpoint":args.probe,"indexer_endpoint":args.indexer,"rest_build":head,
         "requested_seconds":args.seconds,"warmup_seconds":args.warmup_seconds,"elapsed_seconds":origin.elapsed().as_secs_f64(),
+        "include_data":ready.include_data,"data_transactions":data_transactions,"incomplete_data_transactions":incomplete_data_transactions,"events_received":events_received,"write_set_changes_received":changes_received,"data_incomplete":incomplete_data_transactions>0,
         "counts":matcher.counts,"samples":n,"p01_ms":quantile(&deltas,0.01),"p05_ms":quantile(&deltas,0.05),
         "p50_ms":quantile(&deltas,0.5),"p95_ms":quantile(&deltas,0.95),"p99_ms":quantile(&deltas,0.99),
         "mean_ms":if n == 0 { None } else { Some(deltas.iter().sum::<f64>() / n as f64) },"min_ms":deltas.first(),"max_ms":deltas.last(),"negative_fraction":fraction(|x|x<0.0),"at_least_5ms_fraction":fraction(|x|x>=5.0),
         "probe_match_coverage":if matcher.counts.matched+matcher.counts.probe_only==0 { None } else { Some(matcher.counts.matched as f64/(matcher.counts.matched+matcher.counts.probe_only) as f64) },
         "sequence_gaps":sequence_gaps,"dropped_blocks":dropped_blocks,"writer_dropped_batches":writer_drops,
         "writer_error":writer_result.as_ref().err().map(ToString::to_string),"disconnect":disconnect,
-        "insufficient_samples":n<10000,"measurement_impaired":dropped_blocks>0 || sequence_gaps>0 || matcher.counts.evicted>0 || writer_drops>0 || writer_result.is_err() || disconnect.is_some(),
+        "insufficient_samples":n<10000,"measurement_impaired":incomplete_data_transactions>0 || dropped_blocks>0 || sequence_gaps>0 || matcher.counts.evicted>0 || writer_drops>0 || writer_result.is_err() || disconnect.is_some(),
         "metric":"Indexer receive minus probe receive on the same client monotonic clock; not execution_done absolute latency"});
     tokio::fs::write(
         args.out.join("summary.json"),

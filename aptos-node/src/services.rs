@@ -44,7 +44,7 @@ const INTRA_NODE_CHANNEL_BUFFER_SIZE: usize = 1;
 const DEFAULT_MAX_NUM_WORKER_THREADS: usize = 32;
 
 /// Bootstraps the API and transaction streaming services. Returns the
-/// Mempool client receiver, runtimes, and the Mempool client sender.
+/// Mempool client receiver, runtimes, Mempool sender, and shared Indexer reader.
 pub fn bootstrap_api_and_streaming(
     node_config: &NodeConfig,
     db_rw: DbReaderWriter,
@@ -60,6 +60,7 @@ pub fn bootstrap_api_and_streaming(
     Option<Runtime>,
     Option<Runtime>,
     MempoolClientSender,
+    Option<Arc<dyn IndexerReader>>,
 )> {
     // Create the mempool client and sender
     let (mempool_client_sender, mempool_client_receiver) =
@@ -112,7 +113,7 @@ pub fn bootstrap_api_and_streaming(
         chain_id,
         db_rw.reader.clone(),
         mempool_client_sender.clone(),
-        indexer_reader,
+        indexer_reader.clone(),
         indexer_grpc_port_tx,
     );
 
@@ -123,6 +124,7 @@ pub fn bootstrap_api_and_streaming(
         indexer_grpc,
         db_indexer_runtime,
         mempool_client_sender,
+        indexer_reader,
     ))
 }
 

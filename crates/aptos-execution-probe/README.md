@@ -16,6 +16,7 @@ Add to the new node's YAML and restart its existing plain-file process:
 ```yaml
 execution_probe:
   enabled: true
+  include_data: false
   address: "100.104.174.67:50052"
 ```
 
@@ -92,3 +93,59 @@ subscriptions constant and record workload/CPU during the experiment: conversion
 for this client can itself add Indexer load. First-run numbers reflect that load,
 not the production bot's filtered stream in isolation. The source needs a readable
 chain-ID resource at startup; enable it on the already-synchronized Observer node.
+
+## Events and write-set changes
+
+Enable the optional background conversion and restart the node:
+
+```yaml
+execution_probe:
+  enabled: true
+  include_data: true
+  address: "100.104.174.67:50052"
+```
+
+`include_data` defaults to false. Ready and each response advertise the selected
+mode. `transactions` remains the original identity list. When enabled,
+`transaction_data` has one matching entry per identity, in the same order:
+
+- `hash` and `transaction_index` identify the executed transaction.
+- `events` contains `aptos.transaction.v1.Event`, including decoded JSON `data`.
+- `write_set_changes` contains `aptos.transaction.v1.WriteSetChange`, including
+  decoded resource JSON and table-item data when metadata is available.
+- `data_complete` and `conversion_error` report decoding quality.
+- On incomplete conversion, `raw_events_bcs` and `raw_write_set_bcs` preserve
+  original data for consumers with their own schemas. These fields are absent
+  for complete conversions. A raw serialization failure is explicitly reported.
+
+The gRPC API remains `ExecutionProbe/Subscribe`, not `RawData/GetTransactions`.
+The bot needs a probe adapter; it can reuse its Event/WriteSetChange parsers.
+Never use these messages to advance the committed Indexer cursor. No finalized
+ledger version, accumulator root or checkpoint hash is invented.
+
+The worker reuses the same conversion functions as the fullnode Indexer, with
+the block's executed state for module layouts and the node's existing shared
+IndexerReader for table metadata. If persistence overtakes the queued block,
+the resolver uses its exact historical version only after confirming ancestry.
+Unrelated branches and decoding failures produce incomplete data, not silently
+empty complete results. Newly created table metadata may not yet exist; the
+worker does not wait for table-info progress. Preserve this distinction in bot
+handling and skip incomplete results unless the adapter can decode the raw data.
+
+Data conversion runs on the probe runtime's blocking worker, never in the
+execution thread. Responses are capped at 3 MiB and 1,000 identities; a single
+oversized transaction rejects the whole block observation before publication
+and increments dropped_blocks/payload_block_errors. Identity-only mode retains
+the existing lightweight worker path.
+
+Rebuild the comparison client too. The existing command works unchanged and
+measures reception after the larger data response is decoded. Its summary adds
+`include_data`, `data_transactions`, `events_received`,
+`write_set_changes_received`, `incomplete_data_transactions` and `data_incomplete`.
+Incomplete conversions mark the measurement impaired, since those rows cannot
+establish delivery latency of complete business data. CSV still contains one row
+per paired transaction and does not archive the actual events/changes.
+
+Compare this new run to identity-only mode under comparable block work and
+subscription load. The old 34 ms median lead was measured with identifiers;
+it does not predict data-mode lead or bot state-application latency.

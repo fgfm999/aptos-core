@@ -1,11 +1,24 @@
 syntax = "proto3";
 package aptos.experimental.execution.v1;
+import "aptos/transaction/v1/transaction.proto";
 
 message SubscribeRequest {}
 // Live-only, best-effort observations. Events are EXECUTED, never COMMITTED.
 message TransactionId {
   bytes hash = 1;
   uint32 transaction_index = 2;
+}
+// No ledger version or commit roots are fabricated. These are executed results.
+message ExecutedTransactionData {
+  bytes hash = 1;
+  uint32 transaction_index = 2;
+  repeated aptos.transaction.v1.Event events = 3;
+  repeated aptos.transaction.v1.WriteSetChange write_set_changes = 4;
+  bool data_complete = 5;
+  string conversion_error = 6;
+  // Populated on incomplete conversion for consumers with their own BCS schemas.
+  bytes raw_events_bcs = 7;
+  bytes raw_write_set_bcs = 8;
 }
 message ProbeEvent {
   bool ready = 1;
@@ -20,6 +33,8 @@ message ProbeEvent {
   bool last_chunk = 9;
   repeated TransactionId transactions = 10;
   uint64 dropped_blocks = 11;
+  bool include_data = 12;
+  repeated ExecutedTransactionData transaction_data = 13;
 }
 service ExecutionProbe {
   rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);

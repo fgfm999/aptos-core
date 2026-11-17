@@ -2,6 +2,8 @@
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 pub mod compare;
+mod packets;
+pub mod payload;
 pub mod wire;
 
 use anyhow::Result;
@@ -63,6 +65,7 @@ struct Hub {
     chain: u32,
     events: broadcast::Sender<ProbeEvent>,
     dropped: AtomicU64,
+    include_data: bool,
 }
 #[derive(Clone)]
 pub struct Publisher {
@@ -105,19 +108,37 @@ impl Publisher {
 }
 
 pub fn start(address: SocketAddr, chain_id: u32) -> Result<Publisher> {
+    start_configured(address, chain_id, None)
+}
+
+pub fn start_configured(
+    address: SocketAddr,
+    chain_id: u32,
+    context: Option<payload::DataContext>,
+) -> Result<Publisher> {
     let listener = std::net::TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     aptos_logger::info!("Execution probe listening on {}", listener.local_addr()?);
-    start_listener(listener, chain_id)
+    start_listener_with_data(listener, chain_id, context)
 }
 
+#[cfg(test)]
 fn start_listener(listener: std::net::TcpListener, chain_id: u32) -> Result<Publisher> {
+    start_listener_with_data(listener, chain_id, None)
+}
+
+fn start_listener_with_data(
+    listener: std::net::TcpListener,
+    chain_id: u32,
+    context: Option<payload::DataContext>,
+) -> Result<Publisher> {
     let (events, _) = broadcast::channel(256);
     let hub = Arc::new(Hub {
         session: uuid::Uuid::new_v4().to_string(),
         chain: chain_id,
         events,
         dropped: AtomicU64::new(0),
+        include_data: context.is_some(),
     });
     let (sender, mut receiver) = mpsc::channel::<Observation>(16);
     let publisher = Publisher {
@@ -134,20 +155,29 @@ fn start_listener(listener: std::net::TcpListener, chain_id: u32) -> Result<Publ
                 while let Some(o) = receiver.recv().await {
                     DURATIONS.with_label_values(&["queue"]).observe(o.at.elapsed().as_secs_f64());
                     let start = Instant::now();
-                    let ids = successful_ids(&o.output.to_commit);
-                    COUNTERS.with_label_values(&["transactions"]).inc_by(ids.len() as u64);
-                    let chunks = ids.len().div_ceil(1000).max(1);
-                    let mut ids = ids.into_iter();
-                    for index in 0..chunks {
-                        let event = ProbeEvent { ready: false, session_id: worker_hub.session.clone(), chain_id, sequence: o.sequence,
-                            block_id: o.block.to_vec(), parent_block_id: o.parent.to_vec(), execution_done_unix_nanos: o.unix_nanos,
-                            chunk_index: index as u32, last_chunk: index + 1 == chunks, transactions: ids.by_ref().take(1000).collect(),
-                            dropped_blocks: worker_hub.dropped.load(Ordering::Relaxed) };
-                        let _ = worker_hub.events.send(event);
+                    let execution_at = o.at;
+                    let result = if context.is_some() {
+                        let context = context.clone();
+                        let hub = worker_hub.clone();
+                        tokio::task::spawn_blocking(move || packets::build(&o, &hub, context.as_ref())).await.map_err(anyhow::Error::from).and_then(|x| x)
+                    } else { packets::build(&o, &worker_hub, None) };
+                    match result {
+                        Ok(events) => {
+                            for event in events {
+                                COUNTERS.with_label_values(&["transactions"]).inc_by(event.transactions.len() as u64);
+                                let _ = worker_hub.events.send(event);
+                            }
+                            COUNTERS.with_label_values(&["blocks"]).inc();
+                        },
+                        Err(error) => {
+                            worker_hub.dropped.fetch_add(1, Ordering::Relaxed);
+                            COUNTERS.with_label_values(&["dropped_blocks"]).inc();
+                            COUNTERS.with_label_values(&["payload_block_errors"]).inc();
+                            aptos_logger::warn!("Execution probe payload rejected: {}",error);
+                        },
                     }
-                    COUNTERS.with_label_values(&["blocks"]).inc();
                     DURATIONS.with_label_values(&["prepare_publish"]).observe(start.elapsed().as_secs_f64());
-                    DURATIONS.with_label_values(&["execution_to_publish"]).observe(o.at.elapsed().as_secs_f64());
+                    DURATIONS.with_label_values(&["execution_to_publish"]).observe(execution_at.elapsed().as_secs_f64());
                 }
             };
             let server = tonic::transport::Server::builder().add_service(ExecutionProbeServer::new(Service(hub))).serve_with_incoming(TcpListenerStream::new(listener));
@@ -198,6 +228,7 @@ impl ExecutionProbe for Service {
                 session_id: hub.session.clone(),
                 chain_id: hub.chain,
                 dropped_blocks: hub.dropped.load(Ordering::Relaxed),
+                include_data: hub.include_data,
                 ..Default::default()
             }))
             .await
@@ -307,6 +338,7 @@ mod tests {
             chain: 4,
             events,
             dropped: AtomicU64::new(0),
+            include_data: false,
         });
         let _sub = hub.events.subscribe();
         let (sender, _receiver) = mpsc::channel(16);
@@ -332,6 +364,7 @@ mod tests {
             chain: 4,
             events,
             dropped: AtomicU64::new(0),
+            include_data: false,
         });
         let mut stream = Service(hub.clone())
             .subscribe(Request::new(SubscribeRequest {}))
@@ -391,5 +424,53 @@ mod tests {
         let empty = stream.message().await.unwrap().unwrap();
         assert!(empty.transactions.is_empty());
         assert!(empty.last_chunk);
+    }
+    #[tokio::test]
+    async fn actual_grpc_data_mode_carries_typed_output() {
+        struct OutputDb(aptos_storage_interface::state_store::state::State);
+        impl aptos_storage_interface::DbReader for OutputDb {
+            fn get_persisted_state(&self) -> aptos_storage_interface::Result<(Arc<dyn aptos_storage_interface::state_store::state_view::hot_state_view::HotStateView>,aptos_storage_interface::state_store::state::State)>{
+                Ok((Arc::new(aptos_storage_interface::state_store::state_view::hot_state_view::EmptyHotState),self.0.clone()))
+            }
+        }
+        let output = ExecutionOutput::new_dummy_with_input_txns(vec![user()]);
+        let db = Arc::new(OutputDb(output.result_state.latest().clone()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let publisher = start_listener_with_data(
+            listener,
+            4,
+            Some(payload::DataContext {
+                db,
+                indexer_reader: None,
+            }),
+        )
+        .unwrap();
+        let mut client = wire::execution_probe_client::ExecutionProbeClient::connect(format!(
+            "http://{address}"
+        ))
+        .await
+        .unwrap();
+        let mut stream = client
+            .subscribe(SubscribeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().unwrap().include_data);
+        publisher.publish(HashValue::zero(), HashValue::zero(), output);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(event.include_data);
+        assert_eq!(event.transaction_data.len(), 1);
+        assert_eq!(event.transaction_data[0].hash, event.transactions[0].hash);
+        assert!(
+            event.transaction_data[0].data_complete,
+            "{}",
+            event.transaction_data[0].conversion_error
+        );
     }
 }

@@ -6,6 +6,10 @@ license = { workspace = true }
 publish = false
 
 [dependencies]
+aptos-api-types = { workspace = true }
+aptos-indexer-grpc-fullnode = { workspace = true }
+aptos-storage-interface = { workspace = true }
+bcs = { workspace = true }
 anyhow = { workspace = true }
 aptos-crypto = { workspace = true }
 aptos-executor-types = { workspace = true }
@@ -24,3 +28,8 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+aptos-types = { workspace = true, features = ["testing"] }
+move-binary-format = { workspace = true }
+move-core-types = { workspace = true }

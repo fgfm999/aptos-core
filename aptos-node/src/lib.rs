@@ -835,6 +835,7 @@ pub fn setup_environment_and_start_node(
         indexer_grpc_runtime,
         internal_indexer_db_runtime,
         mempool_client_sender,
+        probe_indexer_reader,
     ) = services::bootstrap_api_and_streaming(
         &node_config,
         db_rw.clone(),
@@ -890,6 +891,7 @@ pub fn setup_environment_and_start_node(
             consensus_to_mempool_sender.clone(),
             db_rw.clone(),
             consensus_observer_reconfig_subscription,
+            probe_indexer_reader,
         );
 
     // Create the consensus runtime (if enabled)

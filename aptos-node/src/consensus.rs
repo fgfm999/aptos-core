@@ -149,6 +149,7 @@ pub fn create_consensus_observer_and_publisher(
     consensus_observer_reconfig_subscription: Option<
         ReconfigNotificationListener<DbBackedOnChainConfig>,
     >,
+    probe_indexer_reader: Option<Arc<dyn aptos_types::indexer::indexer_db_reader::IndexerReader>>,
 ) -> (
     Option<Runtime>,
     Option<Runtime>,
@@ -195,6 +196,7 @@ pub fn create_consensus_observer_and_publisher(
         consensus_to_mempool_sender,
         db_rw,
         consensus_observer_reconfig_subscription,
+        probe_indexer_reader,
     );
 
     (
@@ -217,6 +219,7 @@ fn create_consensus_observer(
     consensus_to_mempool_sender: Sender<QuorumStoreRequest>,
     db_rw: DbReaderWriter,
     observer_reconfig_subscription: Option<ReconfigNotificationListener<DbBackedOnChainConfig>>,
+    probe_indexer_reader: Option<Arc<dyn aptos_types::indexer::indexer_db_reader::IndexerReader>>,
 ) {
     // If the observer is not enabled, return early
     if !node_config.consensus_observer.observer_enabled {
@@ -234,6 +237,7 @@ fn create_consensus_observer(
         consensus_to_mempool_sender,
         db_rw,
         observer_reconfig_subscription,
+        probe_indexer_reader,
     );
 }
 
