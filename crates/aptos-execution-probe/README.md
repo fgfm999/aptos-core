@@ -51,6 +51,28 @@ queue/sequence loss and writer errors. Cross-block duplicate hashes are excluded
 within the 120-second matching window. Reappearance after expiry is a new
 observation; it cannot be classified against records no longer retained.
 
+For matched transactions, the CSV also records `txn_timestamp_unix_micros`,
+`probe_received_unix_micros`, `indexer_received_unix_micros`, `probe_age_ms`, and
+`indexer_age_ms`. Each age is the original client wall-clock receipt time minus
+that transaction's block timestamp, obtained from the matching Indexer
+`Transaction.timestamp`. The probe receipt is saved immediately; it is not
+resampled when the Indexer arrives. This works in identity, JSON, and BCS modes
+without changing the node or decoding BCS bodies.
+
+These ages are block-to-receive ages, not submission/mempool latency or latency
+from execution_done. They require the client clock to be synchronized with the
+chain's timestamp clock. A clock step can affect ages without changing the
+monotonic `delta_ms`. A wall-clock age difference is not a substitute for that
+delta. Timestamp fields are integers in microseconds; ages are milliseconds.
+
+`summary.json.transaction_time` contains sample counts and P50/P95/P99, mean,
+min/max, and negative-sample counts for both ages, using the same matched cohort.
+Missing, zero, pre-epoch, or malformed timestamps leave CSV timestamp/age fields
+blank and reduce the age sample count; their arrival deltas remain valid.
+`transaction_time.measurement_impaired` flags missing/invalid timestamps or
+negative ages. The existing top-level `measurement_impaired` continues to describe
+arrival-delta quality. Neither flag proves clock synchronization.
+
 Negative differences remain in the distribution. A P95 lead of 5 ms does not
 mean that most transactions lead by 5 ms; use `at_least_5ms_fraction` and P05 as
 well. The result compares two delivery paths with different message sizes. It

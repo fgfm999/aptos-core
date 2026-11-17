@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use aptos_execution_probe::{
-    compare::{quantile, Match, Matcher},
+    compare::{quantile, timestamp_unix_micros, Match, Matcher, ReceivedAt},
     wire::{
         execution_probe_client::ExecutionProbeClient, DataFormat, SubscribeRequest,
         BCS_SCHEMA_VERSION,
@@ -110,14 +110,30 @@ async fn main() -> Result<()> {
     let path = args.out.join("matches.csv");
     let writer_task = tokio::spawn(async move {
         let mut file = tokio::io::BufWriter::new(tokio::fs::File::create(path).await?);
-        file.write_all(b"hash,block_id,version,probe_ms,indexer_ms,delta_ms\n")
+        file.write_all(b"hash,block_id,version,probe_ms,indexer_ms,delta_ms,txn_timestamp_unix_micros,probe_received_unix_micros,indexer_received_unix_micros,probe_age_ms,indexer_age_ms\n")
             .await?;
         while let Some(batch) = rows.recv().await {
             for r in batch {
                 file.write_all(
                     format!(
-                        "{},{},{},{:.6},{:.6},{:.6}\n",
-                        r.hash, r.block_id, r.version, r.probe_ms, r.indexer_ms, r.delta_ms
+                        "{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{}\n",
+                        r.hash,
+                        r.block_id,
+                        r.version,
+                        r.probe_ms,
+                        r.indexer_ms,
+                        r.delta_ms,
+                        r.txn_timestamp_unix_micros
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                        r.probe_received_unix_micros,
+                        r.indexer_received_unix_micros,
+                        r.probe_age_ms
+                            .map(|v| format!("{v:.6}"))
+                            .unwrap_or_default(),
+                        r.indexer_age_ms
+                            .map(|v| format!("{v:.6}"))
+                            .unwrap_or_default()
                     )
                     .as_bytes(),
                 )
@@ -128,6 +144,8 @@ async fn main() -> Result<()> {
         Ok::<_, std::io::Error>(())
     });
     let mut deltas = Vec::new();
+    let mut probe_ages = Vec::new();
+    let mut indexer_ages = Vec::new();
     let mut writer_drops = 0u64;
     let mut sequence_gaps = 0u64;
     let mut last_sequence: Option<(u64, u32, bool)> = None;
@@ -143,6 +161,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             result = probe.message() => {
                 let received = origin.elapsed();
+                let received_at = ReceivedAt::now(received)?;
                 let event = match result { Ok(Some(e)) => e, other => { disconnect=Some(format!("probe: {other:?}")); break; } };
                 if received >= finish { break; }
                 if received >= end { continue; }
@@ -167,12 +186,13 @@ async fn main() -> Result<()> {
                     }
                     for t in event.transactions {
                         if t.hash.len()!=32 { disconnect=Some("invalid probe hash".into()); break; }
-                        matcher.probe(hex::encode(t.hash), hex::encode(&event.block_id), received.as_secs_f64()*1000.0);
+                        matcher.probe(hex::encode(t.hash), hex::encode(&event.block_id), received_at);
                     }
                 }
             },
             result = indexer.message() => {
                 let received = origin.elapsed();
+                let received_at = ReceivedAt::now(received)?;
                 let batch = match result { Ok(Some(b)) => b, other => { disconnect=Some(format!("indexer: {other:?}")); break; } };
                 if batch.chain_id != Some(ready.chain_id as u64) { disconnect=Some("Indexer/probe chain mismatch".into()); break; }
                 if received >= warm {
@@ -181,7 +201,8 @@ async fn main() -> Result<()> {
                         if let Some(info) = t.info
                             && info.success && (received < end || matcher.contains(&hex::encode(&info.hash))) {
                             if info.hash.len()!=32 { disconnect=Some("invalid Indexer hash".into()); break; }
-                            matcher.indexer(hex::encode(info.hash),t.version,received.as_secs_f64()*1000.0);
+                            let timestamp = t.timestamp.as_ref().and_then(|t| timestamp_unix_micros(t.seconds, t.nanos));
+                            matcher.indexer(hex::encode(info.hash),t.version,received_at,timestamp);
                         }
                     }
                 }
@@ -194,6 +215,8 @@ async fn main() -> Result<()> {
         let done = origin.elapsed() >= finish;
         let batch = matcher.expire(origin.elapsed().as_secs_f64() * 1000.0, done);
         deltas.extend(batch.iter().map(|r| r.delta_ms));
+        probe_ages.extend(batch.iter().filter_map(|r| r.probe_age_ms));
+        indexer_ages.extend(batch.iter().filter_map(|r| r.indexer_age_ms));
         if !batch.is_empty() && writer.try_send(batch).is_err() {
             writer_drops += 1;
         }
@@ -203,6 +226,8 @@ async fn main() -> Result<()> {
     }
     let batch = matcher.expire(origin.elapsed().as_secs_f64() * 1000.0, true);
     deltas.extend(batch.iter().map(|r| r.delta_ms));
+    probe_ages.extend(batch.iter().filter_map(|r| r.probe_age_ms));
+    indexer_ages.extend(batch.iter().filter_map(|r| r.indexer_age_ms));
     if !batch.is_empty() && writer.try_send(batch).is_err() {
         writer_drops += 1;
     }
@@ -217,10 +242,16 @@ async fn main() -> Result<()> {
             Some(deltas.iter().filter(|&&x| test(x)).count() as f64 / n as f64)
         }
     };
+    let age_samples = probe_ages.len();
+    let timestamp_metrics_impaired =
+        age_samples < n || probe_ages.iter().chain(&indexer_ages).any(|&age| age < 0.0);
+    let probe_age_stats = age_stats(&mut probe_ages);
+    let indexer_age_stats = age_stats(&mut indexer_ages);
     let summary = json!({"session_id":ready.session_id,"chain_id":ready.chain_id,"start_version":version+1,
         "probe_endpoint":args.probe,"indexer_endpoint":args.indexer,"rest_build":head,
         "requested_seconds":args.seconds,"warmup_seconds":args.warmup_seconds,"elapsed_seconds":origin.elapsed().as_secs_f64(),
         "data_format":if ready.data_format == DataFormat::Bcs as i32 { "bcs" } else { "json" },"bcs_schema_version":ready.bcs_schema_version,"bcs_bytes_received":bcs_bytes_received,"include_data":ready.include_data,"data_transactions":data_transactions,"incomplete_data_transactions":incomplete_data_transactions,"events_received":events_received,"write_set_changes_received":changes_received,"data_incomplete":incomplete_data_transactions>0,
+        "transaction_time": {"source":"Indexer Transaction.timestamp: block timestamp, not submission or expiration time", "samples":age_samples,"missing_or_invalid_timestamp_samples":n-age_samples,"probe_age_ms":probe_age_stats,"indexer_age_ms":indexer_age_stats,"clock_synchronization_required":true,"measurement_impaired":timestamp_metrics_impaired},
         "counts":matcher.counts,"samples":n,"p01_ms":quantile(&deltas,0.01),"p05_ms":quantile(&deltas,0.05),
         "p50_ms":quantile(&deltas,0.5),"p95_ms":quantile(&deltas,0.95),"p99_ms":quantile(&deltas,0.99),
         "mean_ms":if n == 0 { None } else { Some(deltas.iter().sum::<f64>() / n as f64) },"min_ms":deltas.first(),"max_ms":deltas.last(),"negative_fraction":fraction(|x|x<0.0),"at_least_5ms_fraction":fraction(|x|x>=5.0),
@@ -240,4 +271,13 @@ async fn main() -> Result<()> {
         bail!("stream disconnected; partial report saved");
     }
     Ok(())
+}
+
+fn age_stats(values: &mut [f64]) -> serde_json::Value {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    json!({"samples":n,"p50_ms":quantile(values,0.5),"p95_ms":quantile(values,0.95),"p99_ms":quantile(values,0.99),
+        "mean_ms":if n==0 {None} else {Some(values.iter().sum::<f64>() / n as f64)},
+        "min_ms":values.first(),"max_ms":values.last(),
+        "negative_samples":values.iter().filter(|&&v|v<0.0).count()})
 }
