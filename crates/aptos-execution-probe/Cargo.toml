@@ -17,6 +17,7 @@ aptos-metrics-core = { workspace = true }
 aptos-protos = { workspace = true }
 aptos-storage-interface = { workspace = true }
 aptos-types = { workspace = true }
+aptos-transaction-filter = { workspace = true }
 bcs = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }

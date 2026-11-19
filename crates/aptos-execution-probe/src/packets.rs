@@ -5,7 +5,7 @@ use crate::{
     payload::DataContext,
     successful_ids,
     wire::{ExecutedTransactionData, ProbeEvent, TransactionId},
-    Hub, Observation, COUNTERS, DURATIONS,
+    Feed, Hub, Observation, COUNTERS, DURATIONS,
 };
 use anyhow::{bail, Result};
 use prost::Message;
@@ -25,11 +25,12 @@ fn nested_size(n: usize) -> usize {
 pub(crate) fn build(
     o: &Observation,
     hub: &Hub,
+    feed: &Feed,
     context: Option<&DataContext>,
 ) -> Result<Vec<ProbeEvent>> {
     let filter_started = Instant::now();
-    let ids = successful_ids(&o.output.to_commit, hub.filter.as_ref());
-    if hub.filter.is_some() {
+    let ids = successful_ids(&o.output.to_commit, feed.filter.as_ref());
+    if feed.filter.is_some() {
         DURATIONS
             .with_label_values(&["filter"])
             .observe(filter_started.elapsed().as_secs_f64());
@@ -69,7 +70,11 @@ pub(crate) fn build(
             data_format: hub.data_format as i32,
             bcs_schema_version: hub.bcs_schema_version,
             transaction_filter_json: String::new(),
-            dropped_blocks: hub.dropped.load(Ordering::Relaxed),
+            subscription_filter_json: String::new(),
+            dropped_blocks: hub
+                .dropped
+                .load(Ordering::Relaxed)
+                .saturating_add(feed.dropped.load(Ordering::Relaxed)),
         };
         if event.encoded_len() > MAX_BYTES {
             bail!("probe message exceeds byte limit");

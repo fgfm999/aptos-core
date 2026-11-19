@@ -2,7 +2,11 @@ syntax = "proto3";
 package aptos.experimental.execution.v1;
 import "aptos/transaction/v1/transaction.proto";
 
-message SubscribeRequest {}
+message SubscribeRequest {
+  // Optional Indexer BooleanTransactionFilter config JSON. Applied before serialization,
+  // in addition to the node startup filter. Empty preserves the default selection.
+  string transaction_filter_json = 1;
+}
 enum DataFormat {
   JSON = 0;
   BCS = 1;
@@ -48,6 +52,8 @@ message ProbeEvent {
   uint32 bcs_schema_version = 15;
   // Ready-only startup filter in config JSON. Empty means no extra filter.
   string transaction_filter_json = 16;
+  // Ready-only acknowledgement of the accepted per-subscription filter.
+  string subscription_filter_json = 17;
 }
 service ExecutionProbe {
   rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);

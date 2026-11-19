@@ -12,7 +12,10 @@ pub enum DataFormat {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct SubscribeRequest {}
+pub struct SubscribeRequest {
+    #[prost(string, tag = "1")]
+    pub transaction_filter_json: String,
+}
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct TransactionId {
     #[prost(bytes = "vec", tag = "1")]
@@ -78,5 +81,7 @@ pub struct ProbeEvent {
     /// Ready-only startup filter, serialized as config JSON; empty means no filter.
     #[prost(string, tag = "16")]
     pub transaction_filter_json: String,
+    #[prost(string, tag = "17")]
+    pub subscription_filter_json: String,
 }
 include!("service.rs");

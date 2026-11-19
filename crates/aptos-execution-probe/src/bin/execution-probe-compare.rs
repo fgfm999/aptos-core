@@ -50,9 +50,10 @@ async fn main() -> Result<()> {
     let timeout = Duration::from_secs(15);
     let mut probe_client =
         tokio::time::timeout(timeout, ExecutionProbeClient::connect(args.probe.clone())).await??;
-    let mut probe = tokio::time::timeout(timeout, probe_client.subscribe(SubscribeRequest {}))
-        .await??
-        .into_inner();
+    let mut probe =
+        tokio::time::timeout(timeout, probe_client.subscribe(SubscribeRequest::default()))
+            .await??
+            .into_inner();
     let ready = tokio::time::timeout(timeout, probe.message())
         .await??
         .context("probe closed before Ready")?;

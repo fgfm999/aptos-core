@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         .await??;
         let mut stream = tokio::time::timeout(
             Duration::from_secs(15),
-            client.subscribe(SubscribeRequest {}),
+            client.subscribe(SubscribeRequest::default()),
         )
         .await??
         .into_inner();

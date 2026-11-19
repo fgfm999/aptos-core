@@ -13,7 +13,11 @@ use move_core_types::{
     language_storage::TypeTag,
 };
 
+#[derive(Clone)]
 pub(crate) enum RawFilter {
+    Constant(bool),
+    /// Indexer UserTransactionFilter treats an absent entry payload as unconstrained.
+    UserFunction(NamePattern),
     And(Vec<Self>),
     Or(Vec<Self>),
     Not(Box<Self>),
@@ -21,6 +25,7 @@ pub(crate) enum RawFilter {
     EntryFunction(NamePattern),
     Event(NamePattern, Option<TypeTag>),
 }
+#[derive(Clone)]
 pub(crate) struct NamePattern {
     address: Option<AccountAddress>,
     module: Option<Identifier>,
@@ -112,6 +117,96 @@ impl RawFilter {
         })
     }
 
+    /// Compile the Indexer config dialect once, before any transaction serialization.
+    /// Only predicates available from native fields are accepted. JSON event-data
+    /// substring predicates require Move layout conversion and are rejected explicitly.
+    pub(crate) fn compile_subscription(json: &str) -> Result<(Self, String)> {
+        use aptos_transaction_filter::{BooleanTransactionFilter, Filterable};
+        ensure!(
+            json.len() <= 16 * 1024,
+            "subscription transaction_filter exceeds 16 KiB"
+        );
+        let config: BooleanTransactionFilter =
+            serde_json::from_str(json).context("subscription transaction_filter JSON")?;
+        config
+            .is_valid()
+            .map_err(|e| anyhow::anyhow!("invalid subscription transaction_filter: {e}"))?;
+        let canonical = serde_json::to_string(&config)?;
+        let mut remaining = 256;
+        Ok((
+            Self::compile_indexer(config.into_proto(), 0, &mut remaining)?,
+            canonical,
+        ))
+    }
+
+    fn compile_indexer(
+        filter: aptos_protos::indexer::v1::BooleanTransactionFilter,
+        depth: usize,
+        remaining: &mut usize,
+    ) -> Result<Self> {
+        use aptos_protos::indexer::v1::{
+            api_filter::Filter as Api, boolean_transaction_filter::Filter,
+        };
+        ensure!(
+            depth <= 32 && *remaining > 0,
+            "subscription transaction_filter exceeds depth/node limits"
+        );
+        *remaining -= 1;
+        Ok(match filter.filter.context("missing filter expression")? {
+            Filter::LogicalAnd(f) => Self::And(
+                f.filters
+                    .into_iter()
+                    .map(|f| Self::compile_indexer(f, depth + 1, remaining))
+                    .collect::<Result<_>>()?,
+            ),
+            Filter::LogicalOr(f) => Self::Or(
+                f.filters
+                    .into_iter()
+                    .map(|f| Self::compile_indexer(f, depth + 1, remaining))
+                    .collect::<Result<_>>()?,
+            ),
+            Filter::LogicalNot(f) => {
+                Self::Not(Box::new(Self::compile_indexer(*f, depth + 1, remaining)?))
+            },
+            Filter::ApiFilter(f) => match f.filter.context("missing API predicate")? {
+                Api::TransactionRootFilter(f) => {
+                    // All probe candidates are already successful user transactions.
+                    let user =
+                        aptos_protos::transaction::v1::transaction::TransactionType::User as i32;
+                    Self::Constant(
+                        f.success.unwrap_or(true) && f.transaction_type.is_none_or(|t| t == user),
+                    )
+                },
+                Api::UserTransactionFilter(f) => {
+                    let mut conditions = Vec::new();
+                    if let Some(sender) = f.sender {
+                        conditions.push(Self::Sender(sender.parse().context("filter sender")?));
+                    }
+                    if let Some(payload) = f.payload_filter {
+                        let function = payload
+                            .entry_function_filter
+                            .context("payload filter needs function")?;
+                        let pattern = NamePattern::compile(
+                            &function.address,
+                            &function.module_name,
+                            &function.function,
+                        )?;
+                        ensure!(!pattern.is_empty(), "entry function filter needs a field");
+                        conditions.push(Self::UserFunction(pattern));
+                    }
+                    Self::And(conditions)
+                },
+                Api::EventFilter(f) => {
+                    ensure!(f.data_substring_filter.is_none(), "probe transaction_filter does not support EventFilter.data_substring_filter; use struct_type without body decoding");
+                    let tag = f.struct_type.context("event filter needs struct_type")?;
+                    let pattern = NamePattern::compile(&tag.address, &tag.module, &tag.name)?;
+                    ensure!(!pattern.is_empty(), "event struct_type needs a field");
+                    Self::Event(pattern, None)
+                },
+            },
+        })
+    }
+
     /// Entry matching describes the outer executable, not its internal Move calls.
     /// Scripts/unavailable executables do not match EntryFunction; NOT negates that result.
     /// Event leaves require one event to satisfy every supplied field on that leaf.
@@ -121,6 +216,15 @@ impl RawFilter {
         output: &TransactionOutput,
     ) -> bool {
         match self {
+            Self::Constant(value) => *value,
+            Self::UserFunction(pattern) => match transaction.executable_ref() {
+                Ok(TransactionExecutableRef::EntryFunction(entry)) => pattern.matches(
+                    entry.module().address(),
+                    entry.module().name(),
+                    entry.function(),
+                ),
+                _ => true,
+            },
             Self::And(filters) => filters.iter().all(|f| f.matches(transaction, output)),
             Self::Or(filters) => filters.iter().any(|f| f.matches(transaction, output)),
             Self::Not(filter) => !filter.matches(transaction, output),
@@ -302,5 +406,127 @@ mod tests {
         ] {
             assert!(compile(value.clone()).is_err(), "{value}");
         }
+    }
+    fn subscription_projection(
+        txn: &SignedTransaction,
+        output: &TransactionOutput,
+    ) -> aptos_protos::transaction::v1::Transaction {
+        use aptos_protos::transaction::v1 as pb;
+        let payload = match txn.executable_ref() {
+            Ok(TransactionExecutableRef::EntryFunction(entry)) => Some(pb::TransactionPayload {
+                payload: Some(pb::transaction_payload::Payload::EntryFunctionPayload(
+                    pb::EntryFunctionPayload {
+                        function: Some(pb::EntryFunctionId {
+                            module: Some(pb::MoveModuleId {
+                                address: entry.module().address().to_hex_literal(),
+                                name: entry.module().name().to_string(),
+                            }),
+                            name: entry.function().to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        let events = output
+            .events()
+            .iter()
+            .map(|event| {
+                let kind = match event.type_tag() {
+                    TypeTag::Struct(tag) => Some(pb::MoveType {
+                        content: Some(pb::move_type::Content::Struct(pb::MoveStructTag {
+                            address: tag.address.to_hex_literal(),
+                            module: tag.module.to_string(),
+                            name: tag.name.to_string(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    _ => None,
+                };
+                pb::Event {
+                    r#type: kind,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        pb::Transaction {
+            r#type: pb::transaction::TransactionType::User as i32,
+            info: Some(pb::TransactionInfo {
+                success: true,
+                ..Default::default()
+            }),
+            txn_data: Some(pb::transaction::TxnData::User(pb::UserTransaction {
+                request: Some(pb::UserTransactionRequest {
+                    sender: txn.sender().to_hex_literal(),
+                    payload,
+                    ..Default::default()
+                }),
+                events,
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn subscription_dialect_matches_indexer_predicates_including_missing_payload_and_not() {
+        use aptos_transaction_filter::{BooleanTransactionFilter, Filterable};
+        let (entry, output) = fixture();
+        let script = crate::tests::user();
+        let event = json!({"type":"EventFilter","struct_type":{"address":crate::decibel::DECIBEL,"module":"market_types","name":"OrderEvent"}});
+        let function = json!({"type":"UserTransactionFilter","payload":{"function":{"address":crate::decibel::DECIBEL}}});
+        let sender = json!({"type":"UserTransactionFilter","sender":"0x1"});
+        let root = json!({"type":"TransactionRootFilter","success":true,"txn_type":4});
+        let expressions = vec![
+            root.clone(),
+            function.clone(),
+            event.clone(),
+            sender.clone(),
+            json!({"not":function.clone()}),
+            json!({"and":[root.clone(),{"not":function.clone()}]}),
+            json!({"or":[function.clone(),sender]}),
+            json!({"not":{"or":[event,function]}}),
+            json!({"type":"TransactionRootFilter","success":false}),
+            json!({"type":"TransactionRootFilter","txn_type":1}),
+            json!({"not":{"type":"TransactionRootFilter","success":false}}),
+            json!({"and":[]}),
+            json!({"or":[]}),
+        ];
+        for transaction in [&entry, &script] {
+            let user = transaction.try_as_signed_user_txn().unwrap();
+            let projection = subscription_projection(user, &output);
+            for expression in &expressions {
+                let config: BooleanTransactionFilter =
+                    serde_json::from_value(expression.clone()).unwrap();
+                config.is_valid().unwrap();
+                let (filter, _) = RawFilter::compile_subscription(&expression.to_string()).unwrap();
+                assert_eq!(
+                    filter.matches(user, &output),
+                    config.matches(&projection),
+                    "{expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_complexity_and_json_data_predicates_fail_explicitly() {
+        let mut deep = json!({"type":"TransactionRootFilter","success":true});
+        for _ in 0..34 {
+            deep = json!({"not":deep});
+        }
+        assert!(RawFilter::compile_subscription(&deep.to_string()).is_err());
+        let wide = json!({"and":vec![json!({"type":"TransactionRootFilter","success":true});260]});
+        assert!(RawFilter::compile_subscription(&wide.to_string()).is_err());
+        assert!(RawFilter::compile_subscription(
+            r#"{"type":"EventFilter","data_substring_filter":"x"}"#
+        )
+        .is_err());
+        assert!(RawFilter::compile_subscription(
+            r#"{"type":"UserTransactionFilter","payload":{"function":{"address":"invalid"}}}"#
+        )
+        .is_err());
     }
 }

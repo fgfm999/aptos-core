@@ -17,11 +17,12 @@ use aptos_metrics_core::{
 use aptos_types::transaction::{Transaction, TransactionStatus};
 use once_cell::sync::Lazy;
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -65,7 +66,8 @@ struct Observation {
 struct Hub {
     session: String,
     chain: u32,
-    events: broadcast::Sender<ProbeEvent>,
+    feeds: Mutex<HashMap<String, Weak<Feed>>>,
+    active_feeds: AtomicUsize,
     dropped: AtomicU64,
     include_data: bool,
     data_format: wire::DataFormat,
@@ -73,6 +75,91 @@ struct Hub {
     filter: Option<filter::RawFilter>,
     filter_json: String,
 }
+// Equal validated filters share matching and serialization. Weak registry entries
+// disappear after the last subscriber/worker reference, so disconnects release feeds.
+struct Feed {
+    events: broadcast::Sender<ProbeEvent>,
+    filter: Option<filter::RawFilter>,
+    dropped: AtomicU64,
+    hub: Weak<Hub>,
+}
+impl Drop for Feed {
+    fn drop(&mut self) {
+        if let Some(hub) = self.hub.upgrade() {
+            hub.active_feeds.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+impl Hub {
+    fn subscribe(
+        self: &Arc<Self>,
+        request: &str,
+    ) -> Result<(Arc<Feed>, broadcast::Receiver<ProbeEvent>), Box<Status>> {
+        let (requested, canonical) = if request.is_empty() {
+            (None, String::new())
+        } else {
+            let (filter, canonical) = filter::RawFilter::compile_subscription(request)
+                .map_err(|e| Box::new(Status::invalid_argument(format!("{e:#}"))))?;
+            (Some(filter), canonical)
+        };
+        let mut feeds = self.feeds.lock().expect("probe feed registry");
+        feeds.retain(|_, feed| feed.strong_count() > 0);
+        if let Some(feed) = feeds.get(&canonical).and_then(Weak::upgrade) {
+            let receiver = feed.events.subscribe();
+            return Ok((feed, receiver));
+        }
+        if feeds.len() >= 8 {
+            return Err(Box::new(Status::resource_exhausted(
+                "at most 8 distinct probe subscription filters",
+            )));
+        }
+        let filter = match (self.filter.clone(), requested) {
+            (Some(startup), Some(requested)) => {
+                Some(filter::RawFilter::And(vec![startup, requested]))
+            },
+            (startup, requested) => startup.or(requested),
+        };
+        let (events, receiver) = broadcast::channel(if canonical.is_empty() { 256 } else { 32 });
+        let feed = Arc::new(Feed {
+            events,
+            filter,
+            dropped: AtomicU64::new(0),
+            hub: Arc::downgrade(self),
+        });
+        self.active_feeds.fetch_add(1, Ordering::Relaxed);
+        feeds.insert(canonical, Arc::downgrade(&feed));
+        Ok((feed, receiver))
+    }
+
+    fn live_feeds(&self) -> Vec<Arc<Feed>> {
+        let mut feeds = self.feeds.lock().expect("probe feed registry");
+        feeds.retain(|_, feed| feed.strong_count() > 0);
+        feeds.values().filter_map(Weak::upgrade).collect()
+    }
+}
+
+fn publish_observation(o: &Observation, hub: &Hub, context: Option<&payload::DataContext>) {
+    for feed in hub.live_feeds() {
+        match packets::build(o, hub, &feed, context) {
+            Ok(events) => {
+                for event in events {
+                    COUNTERS
+                        .with_label_values(&["transactions"])
+                        .inc_by(event.transactions.len() as u64);
+                    let _ = feed.events.send(event);
+                }
+                COUNTERS.with_label_values(&["blocks"]).inc();
+            },
+            Err(error) => {
+                feed.dropped.fetch_add(1, Ordering::Relaxed);
+                COUNTERS.with_label_values(&["dropped_blocks"]).inc();
+                COUNTERS.with_label_values(&["payload_block_errors"]).inc();
+                aptos_logger::warn!("Execution probe subscription payload rejected: {}", error);
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Publisher {
     sender: mpsc::Sender<Observation>,
@@ -81,7 +168,7 @@ pub struct Publisher {
 }
 impl Publisher {
     pub fn interested(&self) -> bool {
-        self.hub.events.receiver_count() > 0
+        self.hub.active_feeds.load(Ordering::Relaxed) > 0
     }
 
     /// Called after execution succeeds. Never waits on the worker or a subscriber.
@@ -153,11 +240,11 @@ fn start_listener_with_data(
         filter_json.len() <= 16 * 1024,
         "probe filter metadata exceeds 16 KiB"
     );
-    let (events, _) = broadcast::channel(256);
     let hub = Arc::new(Hub {
         session: uuid::Uuid::new_v4().to_string(),
         chain: chain_id,
-        events,
+        feeds: Mutex::new(HashMap::new()),
+        active_feeds: AtomicUsize::new(0),
         dropped: AtomicU64::new(0),
         include_data: context.is_some(),
         filter,
@@ -189,26 +276,14 @@ fn start_listener_with_data(
                     DURATIONS.with_label_values(&["queue"]).observe(o.at.elapsed().as_secs_f64());
                     let start = Instant::now();
                     let execution_at = o.at;
-                    let result = if context.is_some() {
-                        let context = context.clone();
+                    if let Some(context) = context.clone() {
                         let hub = worker_hub.clone();
-                        tokio::task::spawn_blocking(move || packets::build(&o, &hub, context.as_ref())).await.map_err(anyhow::Error::from).and_then(|x| x)
-                    } else { packets::build(&o, &worker_hub, None) };
-                    match result {
-                        Ok(events) => {
-                            for event in events {
-                                COUNTERS.with_label_values(&["transactions"]).inc_by(event.transactions.len() as u64);
-                                let _ = worker_hub.events.send(event);
-                            }
-                            COUNTERS.with_label_values(&["blocks"]).inc();
-                        },
-                        Err(error) => {
-                            worker_hub.dropped.fetch_add(1, Ordering::Relaxed);
+                        if let Err(error) = tokio::task::spawn_blocking(move || publish_observation(&o,&hub,Some(&context))).await {
+                            worker_hub.dropped.fetch_add(1,Ordering::Relaxed);
                             COUNTERS.with_label_values(&["dropped_blocks"]).inc();
-                            COUNTERS.with_label_values(&["payload_block_errors"]).inc();
-                            aptos_logger::warn!("Execution probe payload rejected: {}",error);
-                        },
-                    }
+                            aptos_logger::warn!("Execution probe worker failed: {}",error);
+                        }
+                    } else { publish_observation(&o,&worker_hub,None); }
                     DURATIONS.with_label_values(&["prepare_publish"]).observe(start.elapsed().as_secs_f64());
                     DURATIONS.with_label_values(&["execution_to_publish"]).observe(execution_at.elapsed().as_secs_f64());
                 }
@@ -269,9 +344,13 @@ impl ExecutionProbe for Service {
 
     async fn subscribe(
         &self,
-        _: Request<SubscribeRequest>,
+        request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let mut source = self.0.events.subscribe();
+        let request = request.into_inner();
+        let (feed, mut source) = self
+            .0
+            .subscribe(&request.transaction_filter_json)
+            .map_err(|status| *status)?;
         let hub = self.0.clone();
         let (sender, receiver) = mpsc::channel(8);
         sender
@@ -279,18 +358,25 @@ impl ExecutionProbe for Service {
                 ready: true,
                 session_id: hub.session.clone(),
                 chain_id: hub.chain,
-                dropped_blocks: hub.dropped.load(Ordering::Relaxed),
+                dropped_blocks: hub
+                    .dropped
+                    .load(Ordering::Relaxed)
+                    .saturating_add(feed.dropped.load(Ordering::Relaxed)),
                 include_data: hub.include_data,
                 data_format: hub.data_format as i32,
                 bcs_schema_version: hub.bcs_schema_version,
                 transaction_filter_json: hub.filter_json.clone(),
+                subscription_filter_json: request.transaction_filter_json,
                 ..Default::default()
             }))
             .await
             .map_err(|_| Status::cancelled("subscriber closed"))?;
         tokio::spawn(async move {
+            let _feed = feed;
             loop {
-                let item = match source.recv().await {
+                let next =
+                    tokio::select! { _ = sender.closed() => break, item = source.recv() => item };
+                let item = match next {
                     Ok(event) => Ok(event),
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -330,7 +416,7 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    fn user() -> Transaction {
+    pub(super) fn user() -> Transaction {
         user_at(AccountAddress::ONE, vec![])
     }
     fn user_at(sender: AccountAddress, code: Vec<u8>) -> Transaction {
@@ -390,11 +476,11 @@ mod tests {
     }
     #[test]
     fn full_queue_drops_without_waiting() {
-        let (events, _) = broadcast::channel(256);
         let hub = Arc::new(Hub {
             session: "test".into(),
             chain: 4,
-            events,
+            feeds: Mutex::new(HashMap::new()),
+            active_feeds: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
             include_data: false,
             data_format: wire::DataFormat::Json,
@@ -402,7 +488,7 @@ mod tests {
             filter: None,
             filter_json: String::new(),
         });
-        let _sub = hub.events.subscribe();
+        let (_feed, _sub) = hub.subscribe("").unwrap();
         let (sender, _receiver) = mpsc::channel(16);
         let permits: Vec<_> = (0..16).map(|_| sender.try_reserve().unwrap()).collect();
         let publisher = Publisher {
@@ -420,11 +506,11 @@ mod tests {
     }
     #[tokio::test]
     async fn lag_is_an_error_not_silent_loss() {
-        let (events, _) = broadcast::channel(256);
         let hub = Arc::new(Hub {
             session: "test".into(),
             chain: 4,
-            events,
+            feeds: Mutex::new(HashMap::new()),
+            active_feeds: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
             include_data: false,
             data_format: wire::DataFormat::Json,
@@ -433,13 +519,16 @@ mod tests {
             filter_json: String::new(),
         });
         let mut stream = Service(hub.clone())
-            .subscribe(Request::new(SubscribeRequest {}))
+            .subscribe(Request::new(SubscribeRequest::default()))
             .await
             .unwrap()
             .into_inner();
         assert!(stream.next().await.unwrap().unwrap().ready);
         for _ in 0..300 {
-            hub.events.send(ProbeEvent::default()).unwrap();
+            hub.live_feeds()[0]
+                .events
+                .send(ProbeEvent::default())
+                .unwrap();
         }
         let error = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -460,7 +549,7 @@ mod tests {
         .await
         .unwrap();
         let mut stream = client
-            .subscribe(SubscribeRequest {})
+            .subscribe(SubscribeRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -534,7 +623,7 @@ mod tests {
         .await
         .unwrap();
         let mut stream = client
-            .subscribe(SubscribeRequest {})
+            .subscribe(SubscribeRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -594,7 +683,7 @@ mod tests {
                 .await
                 .unwrap();
         let mut stream = client
-            .subscribe(SubscribeRequest {})
+            .subscribe(SubscribeRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -682,7 +771,7 @@ mod tests {
                 .await
                 .unwrap();
         let mut stream = client
-            .subscribe(SubscribeRequest {})
+            .subscribe(SubscribeRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -731,7 +820,7 @@ mod tests {
                 .await
                 .unwrap();
         let mut stream = client
-            .subscribe(SubscribeRequest {})
+            .subscribe(SubscribeRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -783,3 +872,6 @@ mod tests {
         assert_eq!(selected[0].transaction_index, 1);
     }
 }
+
+#[cfg(test)]
+mod subscription_tests;
