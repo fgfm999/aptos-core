@@ -6,6 +6,8 @@ message SubscribeRequest {
   // Optional Indexer BooleanTransactionFilter config JSON. Applied before serialization,
   // in addition to the node startup filter. Empty preserves the default selection.
   string transaction_filter_json = 1;
+  // Opt in to generation/boundary controls. Version 0 streams terminate on a boundary.
+  uint32 boundary_protocol_version = 2;
 }
 enum DataFormat {
   JSON = 0;
@@ -33,6 +35,25 @@ message ExecutedTransactionData {
   // aptos_types::transaction::Transaction, for hash and entry-function identification.
   bytes transaction_bcs = 10;
 }
+// A real committed DB anchor. The execution root can be an epoch virtual root.
+message CommittedAnchor {
+  bytes canonical_block_id = 1;
+  bytes execution_root_block_id = 2;
+  uint64 version = 3;
+  uint64 epoch = 4;
+  uint64 round = 5;
+}
+enum BoundaryReason {
+  BOUNDARY_REASON_UNSPECIFIED = 0;
+  EXECUTOR_RESET = 1;
+  EXECUTOR_FINISH = 2;
+  EPOCH_ROOT = 3;
+}
+message StreamBoundary {
+  BoundaryReason reason = 1;
+  // Absent during executor_finish; no post-boundary data is valid until reset.
+  CommittedAnchor anchor = 2;
+}
 message ProbeEvent {
   bool ready = 1;
   string session_id = 2;
@@ -54,6 +75,11 @@ message ProbeEvent {
   string transaction_filter_json = 16;
   // Ready-only acknowledgement of the accepted per-subscription filter.
   string subscription_filter_json = 17;
+  uint32 boundary_protocol_version = 18;
+  uint64 stream_generation = 19;
+  // Ready carries the latest boundary. A control frame has only identity,
+  // format, generation, loss counters and boundary; sequence/chunks/data are empty.
+  StreamBoundary boundary = 20;
 }
 service ExecutionProbe {
   rpc Subscribe(SubscribeRequest) returns (stream ProbeEvent);

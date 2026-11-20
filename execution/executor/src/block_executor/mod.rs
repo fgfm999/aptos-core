@@ -101,7 +101,13 @@ where
     fn reset(&self) -> Result<()> {
         let _guard = CONCURRENCY_GAUGE.concurrency_with(&["block", "reset"]);
 
-        *self.inner.write() = Some(BlockExecutorInner::new(self.db.clone())?);
+        let mut inner = self.inner.write();
+        let next = BlockExecutorInner::new(self.db.clone())?;
+        if let Some(probe) = &self.probe {
+            let ledger = self.db.reader.get_latest_ledger_info()?;
+            probe.executor_reset(ledger.ledger_info(), next.committed_block_id());
+        }
+        *inner = Some(next);
         Ok(())
     }
 
@@ -117,17 +123,17 @@ where
         // guarantee only one block being executed at a time
         let _guard = self.execution_lock.lock();
         let block_id = block.block_id;
-        let capture = self.probe.as_ref().is_some_and(|probe| probe.interested());
-        let output = self
-            .inner
-            .read()
+        let inner = self.inner.read();
+        let capture = self.probe.as_ref().and_then(|probe| probe.capture());
+        let output = inner
             .as_ref()
             .ok_or_else(|| ExecutorError::InternalError {
                 error: "BlockExecutor is not reset".into(),
             })?
-            .execute_and_update_state(block, parent_block_id, onchain_config, capture)?;
-        if let (Some(probe), Some(output)) = (&self.probe, output) {
-            probe.publish(block_id, parent_block_id, output);
+            .execute_and_update_state(block, parent_block_id, onchain_config, capture.is_some())?;
+        drop(inner);
+        if let (Some(probe), Some(generation), Some(output)) = (&self.probe, capture, output) {
+            probe.publish(generation, block_id, parent_block_id, output);
         }
         Ok(())
     }
@@ -162,20 +168,37 @@ where
 
     fn commit_ledger(&self, ledger_info_with_sigs: LedgerInfoWithSignatures) -> ExecutorResult<()> {
         let _guard = CONCURRENCY_GAUGE.concurrency_with(&["block", "commit_ledger"]);
-
-        self.inner
-            .read()
-            .as_ref()
-            .ok_or_else(|| ExecutorError::InternalError {
-                error: "BlockExecutor is not reset".into(),
-            })?
-            .commit_ledger(ledger_info_with_sigs)
+        let epoch_boundary = ledger_info_with_sigs.ledger_info().ends_epoch();
+        // Only epoch transitions serialize commit/root promotion against execution.
+        // Ordinary commits keep their existing concurrency and IO path.
+        let _execution =
+            (epoch_boundary && self.probe.is_some()).then(|| self.execution_lock.lock());
+        let inner = self.inner.read();
+        let inner = inner.as_ref().ok_or_else(|| ExecutorError::InternalError {
+            error: "BlockExecutor is not reset".into(),
+        })?;
+        let previous_root = epoch_boundary.then(|| inner.committed_block_id());
+        let boundary_ledger = epoch_boundary.then(|| ledger_info_with_sigs.ledger_info().clone());
+        inner.commit_ledger(ledger_info_with_sigs)?;
+        if epoch_boundary && previous_root != Some(inner.committed_block_id()) {
+            if let Some(probe) = &self.probe {
+                probe.epoch_root(
+                    boundary_ledger.as_ref().expect("epoch boundary ledger"),
+                    inner.committed_block_id(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn finish(&self) {
         let _guard = CONCURRENCY_GAUGE.concurrency_with(&["block", "finish"]);
 
-        *self.inner.write() = None;
+        let mut inner = self.inner.write();
+        if let Some(probe) = &self.probe {
+            probe.executor_finish();
+        }
+        *inner = None;
     }
 
     fn state_view(&self, block_id: HashValue) -> ExecutorResult<CachedStateView> {

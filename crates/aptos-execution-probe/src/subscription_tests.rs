@@ -64,6 +64,7 @@ async fn subscribe(url: &str, filter: Option<&Value>) -> tonic::Streaming<ProbeE
         .unwrap();
     let mut stream = client
         .subscribe(SubscribeRequest {
+            boundary_protocol_version: 0,
             transaction_filter_json: filter.map(ToString::to_string).unwrap_or_default(),
         })
         .await
@@ -88,6 +89,7 @@ async fn next(stream: &mut tonic::Streaming<ProbeEvent>) -> ProbeEvent {
 }
 fn publish(publisher: &Publisher, sequence: u8, transactions: Vec<Transaction>) {
     publisher.publish(
+        publisher.capture().unwrap(),
         HashValue::new([sequence; 32]),
         HashValue::new([sequence - 1; 32]),
         ExecutionOutput::new_dummy_with_input_txns(transactions),
@@ -112,10 +114,14 @@ async fn grpc_subscription_filters_before_bcs_and_isolates_other_feed_failures()
     let kept = entry("0x1", 1, 0);
     // This transaction exceeds the wire limit. Its native fields must reject it
     // before BCS serialization on the selected feed; only the other feed loses it.
-    publish(&publisher, 1, vec![
-        entry(crate::decibel::DECIBEL, 2, 3 * 1024 * 1024),
-        kept.clone(),
-    ]);
+    publish(
+        &publisher,
+        1,
+        vec![
+            entry(crate::decibel::DECIBEL, 2, 3 * 1024 * 1024),
+            kept.clone(),
+        ],
+    );
     for stream in [&mut selected, &mut duplicate] {
         let event = next(stream).await;
         assert_eq!(event.sequence, 1);
@@ -127,10 +133,11 @@ async fn grpc_subscription_filters_before_bcs_and_isolates_other_feed_failures()
             bcs::from_bytes(&event.transaction_data[0].transaction_bcs).unwrap();
         assert_eq!(decoded.committed_hash(), kept.committed_hash());
     }
-    publish(&publisher, 2, vec![
-        entry(crate::decibel::DECIBEL, 3, 0),
-        entry("0x1", 4, 0),
-    ]);
+    publish(
+        &publisher,
+        2,
+        vec![entry(crate::decibel::DECIBEL, 3, 0), entry("0x1", 4, 0)],
+    );
     for stream in [&mut selected, &mut duplicate] {
         let event = next(stream).await;
         assert_eq!(event.sequence, 2);
@@ -180,6 +187,7 @@ async fn invalid_or_unsupported_filters_are_rejected_before_ready() {
     ] {
         let error = client
             .subscribe(SubscribeRequest {
+                boundary_protocol_version: 0,
                 transaction_filter_json: filter,
             })
             .await
@@ -204,6 +212,7 @@ async fn distinct_filter_limit_shares_identical_requests_and_releases_disconnect
         .unwrap();
     let error = client
         .subscribe(SubscribeRequest {
+            boundary_protocol_version: 0,
             transaction_filter_json: filters[8].to_string(),
         })
         .await

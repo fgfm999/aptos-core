@@ -1,6 +1,7 @@
 // Copyright (c) Aptos Foundation
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
+mod boundaries;
 pub mod compare;
 pub mod decibel;
 mod filter;
@@ -62,10 +63,13 @@ struct Observation {
     at: Instant,
     unix_nanos: u64,
     sequence: u64,
+    generation: u64,
 }
 struct Hub {
     session: String,
     chain: u32,
+    generation: AtomicU64,
+    boundaries: tokio::sync::watch::Sender<boundaries::StreamState>,
     feeds: Mutex<HashMap<String, Weak<Feed>>>,
     active_feeds: AtomicUsize,
     dropped: AtomicU64,
@@ -139,8 +143,28 @@ impl Hub {
 }
 
 fn publish_observation(o: &Observation, hub: &Hub, context: Option<&payload::DataContext>) {
+    publish_observation_with(o, hub, |feed| packets::build(o, hub, feed, context));
+}
+fn publish_observation_with(
+    o: &Observation,
+    hub: &Hub,
+    build: impl Fn(&Feed) -> Result<Vec<ProbeEvent>>,
+) {
+    if o.generation != hub.generation.load(Ordering::Acquire) {
+        COUNTERS
+            .with_label_values(&["stale_generation_blocks"])
+            .inc();
+        return;
+    }
     for feed in hub.live_feeds() {
-        match packets::build(o, hub, &feed, context) {
+        let built = build(&feed);
+        if o.generation != hub.generation.load(Ordering::Acquire) {
+            COUNTERS
+                .with_label_values(&["stale_generation_blocks"])
+                .inc();
+            return;
+        }
+        match built {
             Ok(events) => {
                 for event in events {
                     COUNTERS
@@ -160,6 +184,10 @@ fn publish_observation(o: &Observation, hub: &Hub, context: Option<&payload::Dat
     }
 }
 
+/// Captured while reading the execution state, before VM work starts.
+#[derive(Clone, Copy)]
+pub struct CaptureGeneration(u64);
+
 #[derive(Clone)]
 pub struct Publisher {
     sender: mpsc::Sender<Observation>,
@@ -171,8 +199,25 @@ impl Publisher {
         self.hub.active_feeds.load(Ordering::Relaxed) > 0
     }
 
-    /// Called after execution succeeds. Never waits on the worker or a subscriber.
-    pub fn publish(&self, block: HashValue, parent: HashValue, output: ExecutionOutput) {
+    pub fn capture(&self) -> Option<CaptureGeneration> {
+        self.interested()
+            .then(|| CaptureGeneration(self.hub.generation.load(Ordering::Acquire)))
+    }
+    /// Called after execution succeeds with its original capture generation.
+    /// Never waits on the worker or a subscriber.
+    pub fn publish(
+        &self,
+        generation: CaptureGeneration,
+        block: HashValue,
+        parent: HashValue,
+        output: ExecutionOutput,
+    ) {
+        if generation.0 != self.hub.generation.load(Ordering::Acquire) {
+            COUNTERS
+                .with_label_values(&["stale_generation_blocks"])
+                .inc();
+            return;
+        }
         let at = Instant::now();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         if !self.interested() {
@@ -184,6 +229,7 @@ impl Publisher {
             output,
             at,
             sequence,
+            generation: generation.0,
             unix_nanos: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -242,6 +288,8 @@ fn start_listener_with_data(
     );
     let hub = Arc::new(Hub {
         session: uuid::Uuid::new_v4().to_string(),
+        generation: AtomicU64::new(1),
+        boundaries: boundaries::initial_state(),
         chain: chain_id,
         feeds: Mutex::new(HashMap::new()),
         active_feeds: AtomicUsize::new(0),
@@ -276,11 +324,14 @@ fn start_listener_with_data(
                     DURATIONS.with_label_values(&["queue"]).observe(o.at.elapsed().as_secs_f64());
                     let start = Instant::now();
                     let execution_at = o.at;
+                    let generation = o.generation;
                     if let Some(context) = context.clone() {
                         let hub = worker_hub.clone();
                         if let Err(error) = tokio::task::spawn_blocking(move || publish_observation(&o,&hub,Some(&context))).await {
-                            worker_hub.dropped.fetch_add(1,Ordering::Relaxed);
-                            COUNTERS.with_label_values(&["dropped_blocks"]).inc();
+                            if generation == worker_hub.generation.load(Ordering::Acquire) {
+                                worker_hub.dropped.fetch_add(1,Ordering::Relaxed);
+                                COUNTERS.with_label_values(&["dropped_blocks"]).inc();
+                            }
                             aptos_logger::warn!("Execution probe worker failed: {}",error);
                         }
                     } else { publish_observation(&o,&worker_hub,None); }
@@ -347,15 +398,26 @@ impl ExecutionProbe for Service {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let request = request.into_inner();
+        if request.boundary_protocol_version > wire::BOUNDARY_PROTOCOL_VERSION {
+            return Err(Status::invalid_argument(
+                "unsupported probe boundary protocol version",
+            ));
+        }
         let (feed, mut source) = self
             .0
             .subscribe(&request.transaction_filter_json)
             .map_err(|status| *status)?;
         let hub = self.0.clone();
+        let mut boundaries = hub.boundaries.subscribe();
+        let initial = boundaries.borrow_and_update().clone();
+        let boundary_protocol_version = request.boundary_protocol_version;
         let (sender, receiver) = mpsc::channel(8);
         sender
             .send(Ok(ProbeEvent {
                 ready: true,
+                boundary_protocol_version,
+                stream_generation: initial.generation,
+                boundary: initial.boundary.clone(),
                 session_id: hub.session.clone(),
                 chain_id: hub.chain,
                 dropped_blocks: hub
@@ -373,11 +435,40 @@ impl ExecutionProbe for Service {
             .map_err(|_| Status::cancelled("subscriber closed"))?;
         tokio::spawn(async move {
             let _feed = feed;
+            let mut generation = initial.generation;
             loop {
-                let next =
-                    tokio::select! { _ = sender.closed() => break, item = source.recv() => item };
+                let next = tokio::select! {
+                    biased;
+                    _ = sender.closed() => break,
+                    change = boundaries.changed() => { if change.is_err(){break;} None },
+                    item = source.recv() => Some(item),
+                };
+                let current = boundaries.borrow_and_update().clone();
+                if current.generation != generation {
+                    if boundary_protocol_version == 0 {
+                        let _ = sender.send(Err(Status::aborted("probe execution boundary; reconnect or enable boundary protocol v1"))).await;
+                        break;
+                    }
+                    let mut event = hub.boundary_event(&current);
+                    event.dropped_blocks = event
+                        .dropped_blocks
+                        .saturating_add(_feed.dropped.load(Ordering::Acquire));
+                    if sender.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                    generation = current.generation;
+                }
+                let Some(next) = next else {
+                    continue;
+                };
                 let item = match next {
-                    Ok(event) => Ok(event),
+                    Ok(event) if event.stream_generation == generation => Ok(event),
+                    Ok(_) => {
+                        COUNTERS
+                            .with_label_values(&["stale_generation_frames"])
+                            .inc();
+                        continue;
+                    },
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         COUNTERS.with_label_values(&["lagged_subscribers"]).inc();
@@ -478,6 +569,8 @@ mod tests {
     fn full_queue_drops_without_waiting() {
         let hub = Arc::new(Hub {
             session: "test".into(),
+            generation: AtomicU64::new(1),
+            boundaries: boundaries::initial_state(),
             chain: 4,
             feeds: Mutex::new(HashMap::new()),
             active_feeds: AtomicUsize::new(0),
@@ -497,6 +590,7 @@ mod tests {
             sequence: Arc::new(AtomicU64::new(0)),
         };
         publisher.publish(
+            publisher.capture().unwrap(),
             HashValue::zero(),
             HashValue::zero(),
             ExecutionOutput::new_dummy_with_input_txns(vec![]),
@@ -508,6 +602,8 @@ mod tests {
     async fn lag_is_an_error_not_silent_loss() {
         let hub = Arc::new(Hub {
             session: "test".into(),
+            generation: AtomicU64::new(1),
+            boundaries: boundaries::initial_state(),
             chain: 4,
             feeds: Mutex::new(HashMap::new()),
             active_feeds: AtomicUsize::new(0),
@@ -558,6 +654,7 @@ mod tests {
         assert_eq!(ready.chain_id, 4);
         let tx = user();
         publisher.publish(
+            publisher.capture().unwrap(),
             HashValue::zero(),
             HashValue::zero(),
             ExecutionOutput::new_dummy_with_input_txns(vec![tx.clone(); 1001]),
@@ -572,6 +669,7 @@ mod tests {
         assert_eq!(first.sequence, last.sequence);
         assert_eq!(first.transactions[0].hash, tx.committed_hash().to_vec());
         publisher.publish(
+            publisher.capture().unwrap(),
             HashValue::zero(),
             HashValue::zero(),
             ExecutionOutput::new_dummy_with_input_txns(vec![]),
@@ -628,7 +726,12 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(stream.message().await.unwrap().unwrap().include_data);
-        publisher.publish(HashValue::zero(), HashValue::zero(), output);
+        publisher.publish(
+            publisher.capture().unwrap(),
+            HashValue::zero(),
+            HashValue::zero(),
+            output,
+        );
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
             .await
             .unwrap()
@@ -711,6 +814,7 @@ mod tests {
         .enumerate()
         {
             publisher.publish(
+                publisher.capture().unwrap(),
                 HashValue::zero(),
                 HashValue::zero(),
                 ExecutionOutput::new_dummy_with_input_txns(txns),
@@ -778,6 +882,7 @@ mod tests {
         let ready = stream.message().await.unwrap().unwrap();
         assert!(!ready.include_data && !ready.transaction_filter_json.is_empty());
         publisher.publish(
+            publisher.capture().unwrap(),
             HashValue::zero(),
             HashValue::zero(),
             ExecutionOutput::new_dummy_with_input_txns(vec![
@@ -826,6 +931,7 @@ mod tests {
             .into_inner();
         assert!(stream.message().await.unwrap().unwrap().ready);
         publisher.publish(
+            publisher.capture().unwrap(),
             HashValue::zero(),
             HashValue::zero(),
             ExecutionOutput::new_dummy_with_input_txns(vec![user()]),

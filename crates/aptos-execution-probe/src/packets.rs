@@ -56,6 +56,9 @@ pub(crate) fn build(
     for (i, (ids, data)) in groups.into_iter().enumerate() {
         let event = ProbeEvent {
             ready: false,
+            boundary_protocol_version: crate::wire::BOUNDARY_PROTOCOL_VERSION,
+            stream_generation: o.generation,
+            boundary: None,
             session_id: hub.session.clone(),
             chain_id: hub.chain,
             sequence: o.sequence,
